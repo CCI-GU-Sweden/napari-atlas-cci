@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 from napari.utils.notifications import show_error
 from qtpy.QtCore import Qt, QTimer
-from qtpy.QtGui import QBrush, QColor
+from qtpy.QtGui import QBrush, QColor, QDoubleValidator
 from qtpy.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -19,6 +19,8 @@ from qtpy.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QRadioButton,
+    QComboBox
 )
 
 from .gui import (
@@ -32,13 +34,21 @@ PENDING = QColor("#FFCC66")
 FAILED = QColor("#FF3333")
 UNPROCESSED = QColor("#BEBEBE")
 
+#TODO: Consider making these parameters adjustable in the UI, possibly through an options menu for stitching parameters.
 THREAD_COUNT = 4  # Number of threads for parallel processing (if applicable)
+MAX_SHIFT_PIXELS = 500  # Maximum shift in pixels for stitching (if applicable)
+AXIAL_PIXEL_SIZE = 0.300
+AXIAL_PIXEL_SIZE_UNITS = "µm" #drop down, nm and micron
+AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
+DOWNSCALE = 20
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
         self.viewer = viewer
         self.main_directory = Path.cwd()
+        self.pixel_size = {}
+
         self.pending_series: set[Path] = set()
         self.ongoing_series: set[Path] = set()
         self.failed_series: set[Path] = set()
@@ -72,8 +82,6 @@ class AtlasCCIWidget(QWidget):
         self.local_folder_tree = LocalFolderTree()
         self.local_folder_tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self.main_layout.addWidget(self.local_folder_tree)
-
-        self.refresh_local_folder_tree()
     
         # --- Tile stitching row ---
         self.stitching_layout = QHBoxLayout()
@@ -95,8 +103,42 @@ class AtlasCCIWidget(QWidget):
 
         self.main_layout.addLayout(self.tile_display_layout)
 
-        # --- Z align row ---
+        # --- Z align part ---
+        self.z_align_layout_pixel = QVBoxLayout()
+        self.pixel_size_input = QHBoxLayout()
+        self.axial_pixel_size_input = QLineEdit(str(AXIAL_PIXEL_SIZE)) #pixel size input
+        self.axial_pixel_size_input.setFixedWidth(200)
+        self.axial_pixel_size_input.setToolTip("Axial pixel size in microns")
+        self.axial_pixel_size_input.setValidator(QDoubleValidator(0.01, 1000.0, 3))  # Allow values from 0.0001 to 1000 with 4 decimal places
+        self.axial_pixel_size_input.textChanged.connect(self.update_pixel_size_from_input)
 
+        self.axial_pixel_unit_dropdown = QComboBox()
+        self.axial_pixel_unit_dropdown.addItems(AXIAL_PIXEL_SIZE_UNITS_OPTIONS)
+        self.axial_pixel_unit_dropdown.setCurrentText(AXIAL_PIXEL_SIZE_UNITS)
+        self.axial_pixel_unit_dropdown.currentTextChanged.connect(self.update_pixel_size_from_input)
+
+        self.pixel_size_input_widget = QWidget()
+        self.pixel_size_input.addWidget(self.axial_pixel_size_input)
+        self.pixel_size_input.addWidget(self.axial_pixel_unit_dropdown)
+        self.pixel_size_input_widget.setLayout(self.pixel_size_input)
+        self.z_align_layout_pixel.addWidget(self.pixel_size_input_widget)
+
+        self.rough_zalign_radio_btn = QRadioButton("Rough Z Alignment")
+        self.z_align_layout_pixel.addWidget(self.rough_zalign_radio_btn)
+
+        self.zalign_zshift_button = QPushButton("Calculate Z Shifts")
+        self.zalign_zshift_button.clicked.connect(self.prepare_alignement)
+        self.z_align_layout_pixel.addWidget(self.zalign_zshift_button)
+
+        self.zalign_apply_button = QPushButton("Apply Z Shifts")
+        self.zalign_apply_button.clicked.connect(self.apply_z_shifts)
+        self.z_align_layout_pixel.addWidget(self.zalign_apply_button)
+
+        self.main_layout.addLayout(self.z_align_layout_pixel)
+
+
+
+        self.refresh_local_folder_tree()
 
     def search_for_atlas_project(self, path: str|Path, debug: bool = False) -> list[Path]:
         """
@@ -464,7 +506,6 @@ class AtlasCCIWidget(QWidget):
         import json
 
         buffer_in_microns = 1
-        max_shift_in_pixels = 500 #TODO to expose in the UI - option menu for stitching parameters
         found_mif = False
 
         print(f"Processing series folder: {series_path}")
@@ -488,7 +529,7 @@ class AtlasCCIWidget(QWidget):
                     stitched_img, mif_tile_df, transform_dict = stitch_ATLAS_tiles(
                         mif_file,
                         buffer_microns=buffer_in_microns,
-                        max_shift_pixels=max_shift_in_pixels,
+                        max_shift_pixels=MAX_SHIFT_PIXELS,
                     )
                     # Save the full image as a TIFF file
                     tiff.imwrite(output_tif_path, np.flipud(stitched_img))
@@ -581,4 +622,188 @@ class AtlasCCIWidget(QWidget):
             self.viewer.add_image(stitched_image, name=f"Stitched Image {series_id}")
         except Exception as e:
             show_error(f"Failed to load stitched image: {e}")
-            
+
+    def calculate_z_shifts(self, tif_list_sorted: list[Path]) -> None:
+        from atlas.io import create_empty_folder
+        from atlas.alignment import initialize_alignment_df, pairwise_alignment, calculate_cumulative_shifts
+
+        output_path = Path(self.main_directory).joinpath("alignment_results")
+        create_empty_folder(output_path)
+        z_align_df = initialize_alignment_df(tif_list_sorted, DOWNSCALE)
+        z_align_df = pairwise_alignment(z_align_df)
+        z_align_df = calculate_cumulative_shifts(z_align_df)
+
+        z_align_df_path = output_path.joinpath("z_alignment_results.pkl")
+        z_align_df.to_pickle(z_align_df_path)
+
+    def prepare_alignement(self):
+        csv_file = next(Path(self.main_directory).glob("PhaseCC_stitching_S_*.csv"), None)
+        if csv_file is None:
+            show_error("No PhaseCC CSV file found in the main directory.")
+            return
+        df = pd.read_csv(csv_file)
+        if 'PixelSizeMicron' in df.columns:
+            pix_size_micron =  df['PixelSizeMicron'].max()
+
+        self.pixel_size = {'Value': pix_size_micron, 'Axial':AXIAL_PIXEL_SIZE ,'Unit': AXIAL_PIXEL_SIZE_UNITS}
+
+        tif_list = []
+        for folder in Path(self.main_directory).iterdir():  # Iterate over all items in the folder
+            if folder.is_file() and folder.name.endswith(".tiff"):
+                tif_list.append(folder)
+
+        tif_list_sorted = sorted(tif_list, key=lambda x: int(x.stem.split('_')[-2]))  # Sort by the number in the filename
+
+        self.calculate_z_shifts(tif_list_sorted)
+
+    def reorder_series(self, tif_list_sorted: list[Path]) -> list[Path]:
+        """
+        Reorder the series based on the numeric part of their names.
+        Assumes series names are in the format 'S_<number>'.
+        """
+        from atlas.io import reorder_files_by_s_number, parse_shorthand_order
+
+        correct_order_path = Path(self.main_directory).joinpath("correct_order.txt")
+
+        try:
+            new_order = parse_shorthand_order(correct_order_path)
+            print(f"Loaded correct_order.txt: {new_order}")
+
+            tif_list_sorted = reorder_files_by_s_number(tif_list_sorted, new_order)
+            print("Files reordered based on correct_order.txt:")
+            for f in tif_list_sorted:
+                print(f)
+
+        except FileNotFoundError:
+            print("No correct_order.txt found — using original order.")
+        except Exception as e:
+            print(f"Error reading or applying correct_order.txt: {e}")
+
+        return tif_list_sorted
+
+    def read_align_df(self) -> pd.DataFrame | None:
+        z_align_df_path = Path(self.main_directory).joinpath("alignment_results", "z_alignment_results.pkl")
+        if z_align_df_path.exists():
+            return pd.read_pickle(z_align_df_path)
+        else:
+            show_error("Z alignment results not found. Please run the alignment first.")
+            return None
+
+    def apply_z_shifts(self) -> None:
+        from atlas.io import apply_alignment
+        import dask.array as da
+        from ome_zarr.io import parse_url
+        from ome_zarr.scale import Scaler
+        from ome_zarr.writer import write_image
+        import shutil
+        import zarr
+
+        z_align_df = self.read_align_df()
+        if z_align_df is None:
+            return
+
+        use_downsample = self.rough_zalign_radio_btn.isChecked()
+        zarr_array, _ = apply_alignment(
+            z_align_df,
+            buffer_pixels=20,
+            percentile_low=2.0,
+            percentile_high=99.95,
+            use_down_sample=use_downsample,
+        )
+
+        data = np.asarray(zarr_array)
+        if data.ndim not in (2, 3):
+            show_error(f"Expected 2D or 3D aligned data, got shape {data.shape}.")
+            return
+
+        # Normalize 3D data to ZYX for writing/viewing.
+        if data.ndim == 3:
+            z_axis = int(np.argmin(data.shape))
+            if z_axis != 0:
+                data = np.moveaxis(data, z_axis, 0)
+
+        output_name = f"{Path(self.main_directory).name}{'_downsample' if use_downsample else ''}.zarr"
+        ome_zarr_path = Path(self.main_directory).joinpath(output_name)
+        if ome_zarr_path.exists():
+            shutil.rmtree(ome_zarr_path)
+
+        location = parse_url(str(ome_zarr_path), mode="w")
+        if location is None:
+            show_error(f"Could not create OME-Zarr store at {ome_zarr_path}")
+            return
+
+        root_group = zarr.group(store=location.store)
+
+        # Keep Z as a single chunk while chunking Y/X for efficient reads.
+        if data.ndim == 3:
+            chunk_shape = (
+                int(data.shape[0]),
+                int(min(512, data.shape[1])),
+                int(min(512, data.shape[2])),
+            )
+            axes = "zyx"
+        else:
+            chunk_shape = (
+                int(min(1024, data.shape[0])),
+                int(min(1024, data.shape[1])),
+            )
+            axes = "yx"
+
+        write_image(
+            image=data,
+            group=root_group,
+            scaler=Scaler(max_layer=4),
+            axes=axes,
+            storage_options={"chunks": chunk_shape},
+        )
+
+        print(f"Wrote OME-Zarr pyramid: {ome_zarr_path}")
+
+        multiscales = root_group.attrs.get("multiscales", [])
+        if not multiscales:
+            show_error("OME-Zarr file was written, but no multiscales metadata was found.")
+            return
+
+        datasets = multiscales[0].get("datasets", [])
+        if not datasets:
+            show_error("OME-Zarr file was written, but no pyramid datasets were found.")
+            return
+
+        pyramid = [
+            da.from_zarr(str(ome_zarr_path.joinpath(dataset["path"])))
+            for dataset in datasets
+        ]
+
+        if np.issubdtype(data.dtype, np.integer):
+            p_low, p_high = np.percentile(data, [1.0, 99.8])
+        else:
+            p_low, p_high = np.percentile(data, [0.5, 99.5])
+        if float(p_low) == float(p_high):
+            p_low = float(data.min())
+            p_high = float(data.max())
+
+        layer_name = Path(self.main_directory).name + ("_downsample" if use_downsample else "")
+        if layer_name in self.viewer.layers:
+            self.viewer.layers.remove(layer_name)
+
+        self.viewer.add_image(
+            pyramid,
+            multiscale=True,
+            name=layer_name,
+            contrast_limits=(float(p_low), float(p_high)),
+        )
+    
+    def update_pixel_size_from_input(self):
+        try:
+            new_pixel_size = float(self.axial_pixel_size_input.text())
+            if new_pixel_size <= 0:
+                raise ValueError("Pixel size must be positive.")
+            self.pixel_size['Axial'] = new_pixel_size
+
+            new_pixel_unit = self.axial_pixel_unit_dropdown.currentText()
+            if new_pixel_unit not in AXIAL_PIXEL_SIZE_UNITS_OPTIONS:
+                raise ValueError(f"Invalid pixel size unit: {new_pixel_unit}")
+
+            print(f"Updated axial pixel size to: {new_pixel_size} {new_pixel_unit}")
+        except ValueError as e:
+            show_error(f"Invalid pixel size input: {e}")
