@@ -1,9 +1,9 @@
 import napari
+import re
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
+from typing import cast
 import tifffile as tiff
-import xmltodict
-from dateutil import parser
 import pandas as pd
 import numpy as np
 from napari.utils.notifications import show_error
@@ -15,7 +15,6 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -26,6 +25,8 @@ from qtpy.QtWidgets import (
 from .gui import (
     LocalFolderTree,
 )
+
+from atlas.io import extract_s_number
 
 #status colors
 PROCESSED = QColor("#66CC66")
@@ -60,6 +61,15 @@ class AtlasCCIWidget(QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(150)
         self._status_timer.timeout.connect(self._poll_processing_futures)
+
+        self._zalign_executor = ThreadPoolExecutor(max_workers=1)
+        self._zalign_future: Future | None = None
+        self._zalign_active_action: str | None = None
+        self._zalign_spinner_frames = ("|", "/", "-", "\\")
+        self._zalign_spinner_index = 0
+        self._zalign_timer = QTimer(self)
+        self._zalign_timer.setInterval(120)
+        self._zalign_timer.timeout.connect(self._poll_zalign_future)
         self.setWindowTitle("Atlas CCI")
 
         self.main_layout = QVBoxLayout(self)
@@ -128,15 +138,19 @@ class AtlasCCIWidget(QWidget):
 
         self.zalign_zshift_button = QPushButton("Calculate Z Shifts")
         self.zalign_zshift_button.clicked.connect(self.prepare_alignement)
+        self.zalign_zshift_button.setEnabled(False)
         self.z_align_layout_pixel.addWidget(self.zalign_zshift_button)
 
         self.zalign_apply_button = QPushButton("Apply Z Shifts")
         self.zalign_apply_button.clicked.connect(self.apply_z_shifts)
+        self.zalign_apply_button.setEnabled(False)
         self.z_align_layout_pixel.addWidget(self.zalign_apply_button)
 
+        self.zalign_status_label = QLabel("Z Align: [UNPROCESSED] Idle")
+        self.z_align_layout_pixel.addWidget(self.zalign_status_label)
+        self._set_zalign_status("UNPROCESSED", "Idle", UNPROCESSED)
+
         self.main_layout.addLayout(self.z_align_layout_pixel)
-
-
 
         self.refresh_local_folder_tree()
 
@@ -172,19 +186,6 @@ class AtlasCCIWidget(QWidget):
             self.local_folder_tree.clear()
             return
 
-        if not self.check_for_ve_tie_files(project_root):
-            proceed = QMessageBox.warning(
-                self,
-                "Potentially Invalid Atlas Project",
-                "No ve-tie file detected. The folder may not be a valid atlas project. "
-                "Do you want to proceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if proceed != QMessageBox.StandardButton.Yes:
-                self.local_folder_tree.clear()
-                return
-
         try:
             series_folders = self.search_for_atlas_project(project_root)
         except OSError as exc:
@@ -214,15 +215,57 @@ class AtlasCCIWidget(QWidget):
         self.path_edit.setText(str(self.main_directory))
         self.refresh_local_folder_tree()
 
-    def check_for_ve_tie_files(self, main_path: Path) -> bool:
-        for file in main_path.iterdir():
-            if file.is_file() and file.name.lower().endswith(".ve-tie"):
-                return True
-        return False
-
     def _series_identifier_candidates(self, series_folder: Path) -> list[str]:
-        """Use only the full series folder name as identifier."""
-        return [series_folder.name]
+        """Return likely identifiers for output files across naming conventions."""
+        candidates: list[str] = [series_folder.name]
+
+        try:
+            extracted_id = str(extract_s_number(series_folder.name)).strip()
+        except Exception:
+            extracted_id = ""
+
+        if extracted_id and extracted_id not in candidates:
+            candidates.append(extracted_id)
+
+        if extracted_id.startswith("S_"):
+            numeric_part = extracted_id[2:]
+            if numeric_part and numeric_part not in candidates:
+                candidates.append(numeric_part)
+        elif extracted_id:
+            prefixed = f"S_{extracted_id}"
+            if prefixed not in candidates:
+                candidates.append(prefixed)
+
+        match = re.match(r"^S_(\d+)", series_folder.name)
+        if match:
+            normalized_num = str(int(match.group(1)))
+            normalized_prefixed = f"S_{normalized_num}"
+            if normalized_num not in candidates:
+                candidates.append(normalized_num)
+            if normalized_prefixed not in candidates:
+                candidates.append(normalized_prefixed)
+
+        return candidates
+
+    def _series_sort_key(self, tiff_path: Path) -> tuple[int, str]:
+        """Sort stitched series files robustly across naming convention variants."""
+        try:
+            extracted = str(extract_s_number(tiff_path)).strip()
+        except Exception:
+            extracted = tiff_path.stem
+
+        match = re.search(r"S_(\d+)", extracted)
+        if match is None:
+            match = re.search(r"S_(\d+)", tiff_path.stem)
+        if match is None:
+            match = re.search(r"(\d+)", extracted)
+        if match is None:
+            match = re.search(r"(\d+)", tiff_path.stem)
+
+        if match is None:
+            return (10**12, tiff_path.name.lower())
+
+        return (int(match.group(1)), tiff_path.name.lower())
 
     def _has_expected_output_files(self, root_folder: Path, series_folder: Path) -> tuple[bool, bool, bool]:
         """Check if stitched TIFF, phaseCC CSV, and transforms JSON exist for a series."""
@@ -293,6 +336,81 @@ class AtlasCCIWidget(QWidget):
         has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_folder)
         return has_tiff and has_csv and has_json
 
+    def _has_z_alignment_results(self, root_folder: Path) -> bool:
+        return root_folder.joinpath("alignment_results", "z_alignment_results.pkl").exists()
+
+    def _has_aligned_zarr_output(self, root_folder: Path) -> bool:
+        expected_base = root_folder.name
+        if root_folder.joinpath(f"{expected_base}.zarr").exists():
+            return True
+        if root_folder.joinpath(f"{expected_base}_downsample.zarr").exists():
+            return True
+        return any(path.is_dir() for path in root_folder.glob("*.zarr"))
+
+    def _all_series_processed(self, root_folder: Path) -> bool:
+        root_item = self.local_folder_tree.topLevelItem(0)
+        if root_item is None or root_item.childCount() == 0:
+            return False
+
+        for idx in range(root_item.childCount()):
+            child_item = root_item.child(idx)
+            series_path = self._get_series_path_from_item(child_item)
+            if series_path is None:
+                continue
+            if not self._is_series_processed(root_folder, series_path):
+                return False
+
+        return True
+
+    def _update_project_leaf_and_zalign_controls(self, root_folder: Path) -> None:
+        root_item = self.local_folder_tree.topLevelItem(0)
+        if root_item is None:
+            return
+
+        root_path_text = root_item.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(root_path_text, str) and root_path_text:
+            project_name = Path(root_path_text).name
+        else:
+            project_name = root_folder.name
+
+        all_processed = self._all_series_processed(root_folder)
+        has_zcalc = self._has_z_alignment_results(root_folder)
+        has_zarr = self._has_aligned_zarr_output(root_folder)
+
+        if has_zarr:
+            project_state_label = "[Completed]"
+            project_state_color = PROCESSED
+            project_state_details = "Zarr output present"
+        elif has_zcalc:
+            project_state_label = "[Z-Calculation READY]"
+            project_state_color = ONGOING
+            project_state_details = "Z-shift results ready"
+        elif all_processed:
+            project_state_label = "[Z-Align READY]"
+            project_state_color = PENDING
+            project_state_details = "All 2D stitching outputs found"
+        else:
+            project_state_label = "[Waiting 2D Stitch]"
+            project_state_color = UNPROCESSED
+            project_state_details = "Waiting for all series to be processed"
+
+        root_item.setText(0, f"{project_state_label} {project_name}")
+        root_item.setForeground(0, QBrush(project_state_color))
+        root_item.setToolTip(
+            0,
+            (
+                f"{root_folder}\n"
+                f"State: {project_state_label} {project_state_details}\n"
+                f"all stitched: {'yes' if all_processed else 'no'}\n"
+                f"z_alignment_results.pkl: {'yes' if has_zcalc else 'no'}\n"
+                f"zarr output: {'yes' if has_zarr else 'no'}"
+            ),
+        )
+
+        if not self._is_zalign_running():
+            self.zalign_zshift_button.setEnabled(all_processed)
+            self.zalign_apply_button.setEnabled(has_zcalc)
+
     def update_series_status_indicators(self, root_folder: Path) -> None:
         """Update status labels/colors for each S_ child in the tree."""
         root_item = self.local_folder_tree.topLevelItem(0)
@@ -323,6 +441,7 @@ class AtlasCCIWidget(QWidget):
 
         self.local_folder_tree.viewport().update()
         QApplication.processEvents()
+        self._update_project_leaf_and_zalign_controls(root_folder)
         self._update_display_button_state(root_folder)
 
     def _start_processing_queue(self, series_paths: list[Path]) -> None:
@@ -425,6 +544,86 @@ class AtlasCCIWidget(QWidget):
         self._is_processing = False
         self.update_series_status_indicators(Path(self.main_directory))
 
+    def _is_zalign_running(self) -> bool:
+        return self._zalign_future is not None and not self._zalign_future.done()
+
+    def _set_zalign_status(self, state: str, details: str, color: QColor) -> None:
+        self.zalign_status_label.setText(f"Z Align: [{state}] {details}")
+        self.zalign_status_label.setStyleSheet(f"color: {color.name()}; font-weight: 600;")
+
+    def _set_zalign_buttons_busy(self) -> None:
+        self.zalign_zshift_button.setEnabled(False)
+        self.zalign_apply_button.setEnabled(False)
+        if self._zalign_active_action == "calculate":
+            self._set_zalign_status("ONGOING", "Calculating Z shifts", ONGOING)
+        elif self._zalign_active_action == "apply":
+            self._set_zalign_status("ONGOING", "Applying Z shifts", ONGOING)
+        self._zalign_spinner_index = 0
+        self._update_zalign_busy_text()
+        self._zalign_timer.start()
+
+    def _reset_zalign_buttons_idle(self) -> None:
+        self._zalign_timer.stop()
+        self.zalign_zshift_button.setText("Calculate Z Shifts")
+        self.zalign_apply_button.setText("Apply Z Shifts")
+        self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
+
+    def _update_zalign_busy_text(self) -> None:
+        frame = self._zalign_spinner_frames[self._zalign_spinner_index]
+        self._zalign_spinner_index = (self._zalign_spinner_index + 1) % len(self._zalign_spinner_frames)
+
+        if self._zalign_active_action == "calculate":
+            self.zalign_zshift_button.setText(f"Calculating {frame}")
+            self.zalign_apply_button.setText("Apply Z Shifts")
+        elif self._zalign_active_action == "apply":
+            self.zalign_apply_button.setText(f"Applying {frame}")
+            self.zalign_zshift_button.setText("Calculate Z Shifts")
+
+    def _poll_zalign_future(self) -> None:
+        future = self._zalign_future
+        if future is None:
+            self._reset_zalign_buttons_idle()
+            return
+
+        if not future.done():
+            self._update_zalign_busy_text()
+            return
+
+        action = self._zalign_active_action
+        self._zalign_future = None
+        self._zalign_active_action = None
+        self._reset_zalign_buttons_idle()
+
+        try:
+            success, message, payload = future.result()
+        except Exception as exc:
+            self._set_zalign_status("FAILED", str(exc), FAILED)
+            show_error(f"Z alignment task failed: {exc}")
+            return
+
+        if not success:
+            self._set_zalign_status("FAILED", message, FAILED)
+            show_error(message)
+            return
+
+        if action == "calculate":
+            if isinstance(payload, dict):
+                self.pixel_size = payload
+            self._set_zalign_status("PROCESSED", "Z shifts calculated", PROCESSED)
+            self.update_series_status_indicators(Path(self.main_directory))
+            return
+
+        if action == "apply":
+            typed_payload = cast(dict[str, str | float | list[str]], payload if isinstance(payload, dict) else {})
+            finalize_success, finalize_message = self._finalize_apply_z_shifts(typed_payload)
+            if not finalize_success:
+                self._set_zalign_status("FAILED", finalize_message, FAILED)
+                show_error(finalize_message)
+                self.update_series_status_indicators(Path(self.main_directory))
+                return
+            self._set_zalign_status("PROCESSED", "Z shifts applied", PROCESSED)
+            self.update_series_status_indicators(Path(self.main_directory))
+
     def _get_series_path_from_item(self, item) -> Path | None:
         """Read canonical series path from tree item data, with tooltip fallback."""
         data_path = item.data(0, Qt.ItemDataRole.UserRole)
@@ -455,52 +654,6 @@ class AtlasCCIWidget(QWidget):
 
         self.display_btn.setEnabled(self._is_series_processed(root_folder, series_path))
 
-    def calculate_mask_roi(self, mask):
-        """
-        Compute the tight bounding box (ROI) around valid pixels in a boolean mask.
-
-        Parameters
-        ----------
-        mask : np.ndarray (bool)
-            Boolean array where True marks valid pixels and False invalid pixels.
-
-        Returns
-        -------
-        x0 : int
-            Left (minimum column index) of the ROI (inclusive).
-        x1 : int
-            Right (maximum column index) of the ROI (exclusive, suitable for slicing).
-        y0 : int
-            Top (minimum row index) of the ROI (inclusive).
-        y1 : int
-            Bottom (maximum row index) of the ROI (exclusive, suitable for slicing).
-
-        Raises
-        ------
-        ValueError
-            If the mask contains no valid (True) pixels.
-
-        Notes
-        -----
-        - To crop an image `img` using this ROI, use:
-
-            `img_cropped = img[y0:y1, x0:x1]`
-
-        (row = y, col = x).
-        """
-        assert isinstance(mask, np.ndarray), "mask must be a numpy array"
-        assert mask.dtype == bool, "mask must be a boolean array"
-
-        xs, ys = np.nonzero(mask)
-        if ys.size == 0:
-            raise ValueError("Mask contains no valid (True) pixels.")
-
-        y0, y1 = ys.min(), ys.max() + 1  # +1 to make it slice-exclusive
-        x0, x1 = xs.min(), xs.max() + 1
-
-        return x0, x1, y0, y1
-
-
     def _process_one_series(self, series_path: Path) -> tuple[bool, str]:
         from atlas.stitching import stitch_ATLAS_tiles
         import json
@@ -509,17 +662,17 @@ class AtlasCCIWidget(QWidget):
         found_mif = False
 
         print(f"Processing series folder: {series_path}")
-
-        series_id = series_path.name
-        output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_{series_id}.tiff")
-        output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_{series_id}.csv")
-        output_jason_path = Path(self.main_directory).joinpath(f"transforms_{series_id}.json")
+        first_tif_path = next(series_path.glob("*.tif"))
+        series_id = extract_s_number(first_tif_path)
+        output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_S_{series_id}.tiff")
+        output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_S_{series_id}.csv")
+        output_jason_path = Path(self.main_directory).joinpath(f"transforms_S_{series_id}.json")
 
         for file in series_path.iterdir():
             if file.is_file() and file.suffix.lower() in {".ve-mif"}:
                 found_mif = True
                 print(f"File with '.ve-mif' extension found: {file.name}")
-                mif_file = file
+                mif_file = Path(file)
                 print(f"Output TIFF path: {output_tif_path}")
                 print(f"Output CSV path: {output_cc_path}")
                 print(f"Output JSON path: {output_jason_path}")
@@ -531,6 +684,7 @@ class AtlasCCIWidget(QWidget):
                         buffer_microns=buffer_in_microns,
                         max_shift_pixels=MAX_SHIFT_PIXELS,
                     )
+
                     # Save the full image as a TIFF file
                     tiff.imwrite(output_tif_path, np.flipud(stitched_img))
                     
@@ -610,7 +764,7 @@ class AtlasCCIWidget(QWidget):
             show_error("Only PROCESSED series can be displayed.")
             return
 
-        series_id = series_path.name
+        series_id = extract_s_number(series_path.name)
         stitched_image_path = self._get_stitched_image_path(root_folder, series_path)
 
         if stitched_image_path is None:
@@ -623,11 +777,11 @@ class AtlasCCIWidget(QWidget):
         except Exception as e:
             show_error(f"Failed to load stitched image: {e}")
 
-    def calculate_z_shifts(self, tif_list_sorted: list[Path]) -> None:
+    def calculate_z_shifts(self, tif_list_sorted: list[Path], output_root: Path | None = None) -> None:
         from atlas.io import create_empty_folder
         from atlas.alignment import initialize_alignment_df, pairwise_alignment, calculate_cumulative_shifts
 
-        output_path = Path(self.main_directory).joinpath("alignment_results")
+        output_path = (output_root if output_root is not None else Path(self.main_directory)).joinpath("alignment_results")
         create_empty_folder(output_path)
         z_align_df = initialize_alignment_df(tif_list_sorted, DOWNSCALE)
         z_align_df = pairwise_alignment(z_align_df)
@@ -637,24 +791,62 @@ class AtlasCCIWidget(QWidget):
         z_align_df.to_pickle(z_align_df_path)
 
     def prepare_alignement(self):
-        csv_file = next(Path(self.main_directory).glob("PhaseCC_stitching_S_*.csv"), None)
-        if csv_file is None:
-            show_error("No PhaseCC CSV file found in the main directory.")
+        if self._is_zalign_running():
+            show_error("A Z alignment task is already running.")
             return
+
+        root_folder = Path(self.main_directory)
+        axial_value = self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE)
+        axial_unit = self.axial_pixel_unit_dropdown.currentText()
+
+        self._zalign_active_action = "calculate"
+        self._zalign_future = self._zalign_executor.submit(
+            self._prepare_alignement_worker,
+            root_folder,
+            float(axial_value),
+            str(axial_unit),
+        )
+        self._set_zalign_buttons_busy()
+
+    def _prepare_alignement_worker(
+        self,
+        root_folder: Path,
+        axial_value: float,
+        axial_unit: str,
+    ) -> tuple[bool, str, dict[str, float | str] | None]:
+        csv_candidates = sorted(root_folder.glob("phaseCC_stitching_*.csv"))
+        if not csv_candidates:
+            csv_candidates = sorted(root_folder.glob("PhaseCC_stitching_*.csv"))
+
+        csv_file = csv_candidates[0] if csv_candidates else None
+        if csv_file is None:
+            return False, "No PhaseCC CSV file found in the main directory.", None
+
         df = pd.read_csv(csv_file)
-        if 'PixelSizeMicron' in df.columns:
-            pix_size_micron =  df['PixelSizeMicron'].max()
+        pix_size_micron = float(AXIAL_PIXEL_SIZE)
+        if "PixelSizeMicron" in df.columns:
+            pix_size_micron = float(df["PixelSizeMicron"].max())
 
-        self.pixel_size = {'Value': pix_size_micron, 'Axial':AXIAL_PIXEL_SIZE ,'Unit': AXIAL_PIXEL_SIZE_UNITS}
+        tif_list = [
+            file
+            for file in root_folder.iterdir()
+            if file.is_file() and file.name.endswith(".tiff")
+        ]
+        if not tif_list:
+            return False, "No stitched TIFF files found for Z shift calculation.", None
 
-        tif_list = []
-        for folder in Path(self.main_directory).iterdir():  # Iterate over all items in the folder
-            if folder.is_file() and folder.name.endswith(".tiff"):
-                tif_list.append(folder)
+        tif_list_sorted = sorted(tif_list, key=self._series_sort_key)
+        self.calculate_z_shifts(tif_list_sorted, output_root=root_folder)
 
-        tif_list_sorted = sorted(tif_list, key=lambda x: int(x.stem.split('_')[-2]))  # Sort by the number in the filename
-
-        self.calculate_z_shifts(tif_list_sorted)
+        return (
+            True,
+            "",
+            {
+                "Value": pix_size_micron,
+                "Axial": float(axial_value),
+                "Unit": axial_unit,
+            },
+        )
 
     def reorder_series(self, tif_list_sorted: list[Path]) -> list[Path]:
         """
@@ -690,19 +882,39 @@ class AtlasCCIWidget(QWidget):
             return None
 
     def apply_z_shifts(self) -> None:
+        if self._is_zalign_running():
+            show_error("A Z alignment task is already running.")
+            return
+
+        root_folder = Path(self.main_directory)
+        use_downsample = self.rough_zalign_radio_btn.isChecked()
+
+        self._zalign_active_action = "apply"
+        self._zalign_future = self._zalign_executor.submit(
+            self._apply_z_shifts_worker,
+            root_folder,
+            use_downsample,
+        )
+        self._set_zalign_buttons_busy()
+
+    def _apply_z_shifts_worker(
+        self,
+        root_folder: Path,
+        use_downsample: bool,
+    ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
         from atlas.io import apply_alignment
-        import dask.array as da
         from ome_zarr.io import parse_url
         from ome_zarr.scale import Scaler
         from ome_zarr.writer import write_image
         import shutil
         import zarr
 
-        z_align_df = self.read_align_df()
-        if z_align_df is None:
-            return
+        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        if not z_align_df_path.exists():
+            return False, "Z alignment results not found. Please run the alignment first.", None
 
-        use_downsample = self.rough_zalign_radio_btn.isChecked()
+        z_align_df = pd.read_pickle(z_align_df_path)
+
         zarr_array, _ = apply_alignment(
             z_align_df,
             buffer_pixels=20,
@@ -713,8 +925,7 @@ class AtlasCCIWidget(QWidget):
 
         data = np.asarray(zarr_array)
         if data.ndim not in (2, 3):
-            show_error(f"Expected 2D or 3D aligned data, got shape {data.shape}.")
-            return
+            return False, f"Expected 2D or 3D aligned data, got shape {data.shape}.", None
 
         # Normalize 3D data to ZYX for writing/viewing.
         if data.ndim == 3:
@@ -722,15 +933,14 @@ class AtlasCCIWidget(QWidget):
             if z_axis != 0:
                 data = np.moveaxis(data, z_axis, 0)
 
-        output_name = f"{Path(self.main_directory).name}{'_downsample' if use_downsample else ''}.zarr"
-        ome_zarr_path = Path(self.main_directory).joinpath(output_name)
+        output_name = f"{root_folder.name}{'_downsample' if use_downsample else ''}.zarr"
+        ome_zarr_path = root_folder.joinpath(output_name)
         if ome_zarr_path.exists():
             shutil.rmtree(ome_zarr_path)
 
         location = parse_url(str(ome_zarr_path), mode="w")
         if location is None:
-            show_error(f"Could not create OME-Zarr store at {ome_zarr_path}")
-            return
+            return False, f"Could not create OME-Zarr store at {ome_zarr_path}", None
 
         root_group = zarr.group(store=location.store)
 
@@ -761,18 +971,11 @@ class AtlasCCIWidget(QWidget):
 
         multiscales = root_group.attrs.get("multiscales", [])
         if not multiscales:
-            show_error("OME-Zarr file was written, but no multiscales metadata was found.")
-            return
+            return False, "OME-Zarr file was written, but no multiscales metadata was found.", None
 
         datasets = multiscales[0].get("datasets", [])
         if not datasets:
-            show_error("OME-Zarr file was written, but no pyramid datasets were found.")
-            return
-
-        pyramid = [
-            da.from_zarr(str(ome_zarr_path.joinpath(dataset["path"])))
-            for dataset in datasets
-        ]
+            return False, "OME-Zarr file was written, but no pyramid datasets were found.", None
 
         if np.issubdtype(data.dtype, np.integer):
             p_low, p_high = np.percentile(data, [1.0, 99.8])
@@ -782,16 +985,51 @@ class AtlasCCIWidget(QWidget):
             p_low = float(data.min())
             p_high = float(data.max())
 
-        layer_name = Path(self.main_directory).name + ("_downsample" if use_downsample else "")
-        if layer_name in self.viewer.layers:
-            self.viewer.layers.remove(layer_name)
+        layer_name = root_folder.name + ("_downsample" if use_downsample else "")
 
-        self.viewer.add_image(
-            pyramid,
-            multiscale=True,
-            name=layer_name,
-            contrast_limits=(float(p_low), float(p_high)),
+        return (
+            True,
+            "",
+            {
+                "ome_zarr_path": str(ome_zarr_path),
+                "dataset_paths": [dataset["path"] for dataset in datasets],
+                "layer_name": layer_name,
+                "p_low": float(p_low),
+                "p_high": float(p_high),
+            },
         )
+
+    def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
+        import dask.array as da
+
+        try:
+            ome_zarr_path = Path(str(payload.get("ome_zarr_path", "")))
+            dataset_paths_obj = payload.get("dataset_paths", [])
+            if not isinstance(dataset_paths_obj, list):
+                return False, "Invalid dataset list in Z alignment output."
+
+            dataset_paths = [str(path) for path in dataset_paths_obj]
+            layer_name = str(payload.get("layer_name", "aligned"))
+            p_low = float(str(payload.get("p_low", 0.0)))
+            p_high = float(str(payload.get("p_high", 1.0)))
+
+            pyramid = [
+                da.from_zarr(str(ome_zarr_path.joinpath(dataset_path)))
+                for dataset_path in dataset_paths
+            ]
+
+            if layer_name in self.viewer.layers:
+                self.viewer.layers.remove(self.viewer.layers[layer_name])
+
+            self.viewer.add_image(
+                pyramid,
+                multiscale=True,
+                name=layer_name,
+                contrast_limits=(p_low, p_high),
+            )
+            return True, ""
+        except Exception as exc:
+            return False, f"Failed to display aligned image: {exc}"
     
     def update_pixel_size_from_input(self):
         try:
