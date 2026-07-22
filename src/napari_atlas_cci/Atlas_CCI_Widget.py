@@ -118,8 +118,8 @@ class AtlasCCIWidget(QWidget):
         self.pixel_size_input = QHBoxLayout()
         self.axial_pixel_size_input = QLineEdit(str(AXIAL_PIXEL_SIZE)) #pixel size input
         self.axial_pixel_size_input.setFixedWidth(200)
-        self.axial_pixel_size_input.setToolTip("Axial pixel size in microns")
-        self.axial_pixel_size_input.setValidator(QDoubleValidator(0.01, 1000.0, 3))  # Allow values from 0.0001 to 1000 with 4 decimal places
+        self.axial_pixel_size_input.setToolTip("Axial pixel size in microns (µm) or nanometers (nm).")
+        self.axial_pixel_size_input.setValidator(QDoubleValidator(0.01, 1000.0, 3))
         self.axial_pixel_size_input.textChanged.connect(self.update_pixel_size_from_input)
 
         self.axial_pixel_unit_dropdown = QComboBox()
@@ -154,23 +154,9 @@ class AtlasCCIWidget(QWidget):
 
         self.refresh_local_folder_tree()
 
-    def search_for_atlas_project(self, path: str|Path, debug: bool = False) -> list[Path]:
-        """
-        Search for S_ series folders that contain at least one tif/tiff image.
-        """
-        series_list = []
-        for folder in Path(path).iterdir():  # Iterate over all items in the folder
-            if folder.is_dir() and folder.name.startswith("S_"):
-                tif_files = [
-                    file
-                    for file in folder.iterdir()
-                    if file.is_file() and file.suffix.lower() in {".tif", ".tiff"}
-                ]
-                if tif_files:
-                    if debug:
-                        print(f"Found series folder: {folder.name} (contains {len(tif_files)} .tif files)")
-                    series_list.append(folder)
-
+    def search_for_atlas_project(self, path: str|Path) -> list[Path]:
+        from atlas.io import get_valid_slice_folders
+        series_list, _ = get_valid_slice_folders(Path(path))
         return series_list
 
     def refresh_local_folder_tree(self) -> None:
