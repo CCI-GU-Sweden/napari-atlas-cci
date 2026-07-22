@@ -460,85 +460,38 @@ class AtlasCCIWidget(QWidget):
 
 
     def _process_one_series(self, series_path: Path) -> tuple[bool, str]:
-        from atlas.stitching import add_tile_overlap_columns, match_tiles, build_adjacency_matrix_from_costs, build_transform_dict_from_mst, apply_transforms_and_stitch
-        from atlas.stitching import get_tiles_dataframe, mask_low_and_saturation
+        from atlas.stitching import stitch_ATLAS_tiles
         import json
-        from scipy.sparse import csr_matrix
-        from scipy.sparse.csgraph import minimum_spanning_tree
 
         buffer_in_microns = 1
-        max_shift_in_pixels = 500
+        max_shift_in_pixels = 500 #TODO to expose in the UI - option menu for stitching parameters
         found_mif = False
 
         print(f"Processing series folder: {series_path}")
+
+        series_id = series_path.name
+        output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_{series_id}.tiff")
+        output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_{series_id}.csv")
+        output_jason_path = Path(self.main_directory).joinpath(f"transforms_{series_id}.json")
 
         for file in series_path.iterdir():
             if file.is_file() and file.suffix.lower() in {".ve-mif"}:
                 found_mif = True
                 print(f"File with '.ve-mif' extension found: {file.name}")
                 mif_file = file
-                mif_tile_df = get_tiles_dataframe(mif_file, buffer_microns=buffer_in_microns)
-                series_id = series_path.name
-
-                # Define the output file path
-                output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_{series_id}.tiff")
-                output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_{series_id}.csv")
-                output_jason_path = Path(self.main_directory).joinpath(f"transforms_{series_id}.json")
                 print(f"Output TIFF path: {output_tif_path}")
                 print(f"Output CSV path: {output_cc_path}")
                 print(f"Output JSON path: {output_jason_path}")
-                if output_tif_path.exists():
-                    print(f"✅ Skipping: {output_tif_path.name} already exists.")
-                else:
-                    print(f"🔄 Stitching image for {series_id}...")
+                print(f"🔄 Stitching image for {series_id}...")
                 
                 try:
-                    mif_tile_df = add_tile_overlap_columns(mif_tile_df)
-                    # add info to the DF so we know where to find the images after they have been moved out of the scope
-                    mif_tile_df['raw_data_folder'] = Path(series_path)  # type: ignore[assignment]
-
-                    # Calculate the costs of matching each tile to those that it overlaps with
-                    n = len(mif_tile_df)
-                    all_costs = []
-                    all_shifts = []
-
-                    for current_idx in range(n):
-                        costs, shifts = match_tiles(mif_tile_df, reference_idx=current_idx, min_overlap_percent = 2,)
-                        # here I do the max displacement rule
-                        for i, shift_i in enumerate(shifts):
-                            d = np.linalg.norm(shift_i)
-                            if d > max_shift_in_pixels:
-                                costs[i] = 0.9
-                                shifts[i] = np.array([0.0, 0.0])
-                        
-                        all_costs.append(costs)
-                        all_shifts.append(shifts)
-
-                    mif_tile_df["stitching_costs"] = all_costs
-                    mif_tile_df["stitching_shifts"] = all_shifts
-
-                    # Step 1: Build the cost matrix which I will use as adjacency for the min span tree
-                    adj_matrix = build_adjacency_matrix_from_costs(mif_tile_df, cost_column='stitching_costs')
-
-                    # Step 2: Create sparse matrix and compute MST
-                    graph_sparse = csr_matrix(adj_matrix)
-                    mst = minimum_spanning_tree(graph_sparse)
-                    # The MST will be used to calculate the transofrmation matrices between each tile and a reference tile.
-                    # For the moment I just pick 0 as reference but maybe there is a better way, in general I dont think it matters much.                
-                    transform_dict = build_transform_dict_from_mst(mif_tile_df, mst, reference_tile=0)
-                    
-                    # apply transform, user inputs are transform_dict and mif_tile_df, output is the stitched_img
-                    stitched_img = apply_transforms_and_stitch(mif_tile_df, transform_dict, reference_tile=0)
-                    
-                    # check if there is large dark areas around the obj
-                    mask_valid = ~mask_low_and_saturation(stitched_img)
-                    x0, x1, y0, y1 = self.calculate_mask_roi(mask_valid)
-                    if stitched_img is not None:
-                        crop_img = stitched_img[x0:x1, y0:y1]
-
+                    stitched_img, mif_tile_df, transform_dict = stitch_ATLAS_tiles(
+                        mif_file,
+                        buffer_microns=buffer_in_microns,
+                        max_shift_pixels=max_shift_in_pixels,
+                    )
                     # Save the full image as a TIFF file
-                    #tiff.imwrite(output_tif_path, np.flipud(stitched_img))
-                    tiff.imwrite(output_tif_path, np.flipud(crop_img))
+                    tiff.imwrite(output_tif_path, np.flipud(stitched_img))
                     
                     mif_tile_df.to_csv(output_cc_path, index=False)
 
