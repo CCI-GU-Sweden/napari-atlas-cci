@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import QAbstractItemView, QTreeWidget, QTreeWidgetItem
@@ -66,11 +67,16 @@ class ZarrImageViewer:
             if not datasets:
                 return False, "Zarr output has no pyramid datasets."
 
-            pyramid = [
-                da.from_zarr(str(ome_zarr_path.joinpath(str(dataset["path"]))))
-                for dataset in datasets
-            ]
             display_name = layer_name or ome_zarr_path.stem
+            load_id = uuid4().hex
+
+            pyramid = [
+                da.from_zarr(
+                    str(ome_zarr_path.joinpath(str(dataset["path"]))),
+                    name=f"{display_name}-{load_id}-{idx}",
+                )
+                for idx, dataset in enumerate(datasets)
+            ]
 
             self.remove_layer(display_name)
 

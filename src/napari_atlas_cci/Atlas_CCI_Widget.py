@@ -959,15 +959,38 @@ class AtlasCCIWidget(QWidget):
 
         z_align_df = pd.read_pickle(z_align_df_path)
 
-        zarr_array, _ = apply_alignment(
-            z_align_df,
-            buffer_pixels=20,
-            percentile_low=2.0,
-            percentile_high=99.95,
-            use_down_sample=use_downsample,
-        )
+        print(z_align_df.head(5))
 
-        data = np.asarray(zarr_array)
+        internal_zarr_path = self._zarr_output_path(root_folder, use_downsample=False)
+        preserved_final_zarr_path = internal_zarr_path.with_name(
+            f"{internal_zarr_path.name}.preserved"
+        )
+        if use_downsample:
+            if not internal_zarr_path.exists() and preserved_final_zarr_path.exists():
+                preserved_final_zarr_path.rename(internal_zarr_path)
+            if internal_zarr_path.exists():
+                if preserved_final_zarr_path.exists():
+                    shutil.rmtree(preserved_final_zarr_path)
+                internal_zarr_path.rename(preserved_final_zarr_path)
+
+        zarr_array = None
+        try:
+            zarr_array, _ = apply_alignment(
+                z_align_df,
+                buffer_pixels=20,
+                percentile_low=2.0,
+                percentile_high=99.95,
+                use_down_sample=use_downsample,
+            )
+            data = np.asarray(zarr_array)
+        finally:
+            zarr_array = None
+            if use_downsample:
+                if internal_zarr_path.exists():
+                    shutil.rmtree(internal_zarr_path)
+                if preserved_final_zarr_path.exists():
+                    preserved_final_zarr_path.rename(internal_zarr_path)
+
         if data.ndim not in (2, 3):
             return False, f"Expected 2D or 3D aligned data, got shape {data.shape}.", None
 
@@ -1155,6 +1178,8 @@ class AtlasCCIWidget(QWidget):
         axial_value = self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE)
         axial_unit = self.axial_pixel_unit_dropdown.currentText()
 
+        self._remove_zalign_image_layer(use_downsample=True)
+
         self._zalign_active_action = "initial"
         self._zalign_future = self._zalign_executor.submit(
             self._initial_alignement_worker,
@@ -1176,6 +1201,8 @@ class AtlasCCIWidget(QWidget):
             show_error("Z alignment results not found. Please run initial Z alignment first.")
             self.update_series_status_indicators(root_folder)
             return
+
+        self._remove_zalign_image_layer(use_downsample=False)
 
         self._zalign_active_action = "final"
         self._zalign_future = self._zalign_executor.submit(
@@ -1216,10 +1243,13 @@ class AtlasCCIWidget(QWidget):
         self._display_zalign_zarr(use_downsample=False)
 
     def _remove_zalign_image_layer(self, use_downsample: bool) -> None:
+        import gc
+
         root_folder = Path(self.main_directory)
         layer_name = root_folder.name + ("_downsample" if use_downsample else "")
         if self.zarr_viewer.remove_layer(layer_name):
             QApplication.processEvents()
+            gc.collect()
 
     def _get_viewer_layer(self, name: str):
         for layer in self.viewer.layers:
@@ -1255,20 +1285,20 @@ class AtlasCCIWidget(QWidget):
             "border_color": "black",
         }
         try:
-            return self.viewer.add_points(**add_kwargs)
+            return self.viewer.add_points(**add_kwargs) # pyright: ignore[reportAttributeAccessIssue]
         except TypeError:
             add_kwargs.pop("border_color", None)
             add_kwargs["edge_color"] = "black"
             try:
-                return self.viewer.add_points(**add_kwargs)
+                return self.viewer.add_points(**add_kwargs) # pyright: ignore[reportAttributeAccessIssue]
             except TypeError:
                 add_kwargs.pop("edge_color", None)
                 try:
-                    return self.viewer.add_points(**add_kwargs)
+                    return self.viewer.add_points(**add_kwargs) # pyright: ignore[reportAttributeAccessIssue]
                 except TypeError:
                     add_kwargs.pop("ndim", None)
                     add_kwargs["data"] = np.empty((0, ndim))
-                    return self.viewer.add_points(**add_kwargs)
+                    return self.viewer.add_points(**add_kwargs) # pyright: ignore[reportAttributeAccessIssue]
 
     def _get_or_create_correction_points_layer(
         self,
@@ -1334,6 +1364,10 @@ class AtlasCCIWidget(QWidget):
 
         fixed_points = np.asarray(fixed_layer.data, dtype=float)
         moving_points = np.asarray(moving_layer.data, dtype=float)
+
+        print(f"Applying correction with {len(fixed_points)} fixed points and {len(moving_points)} moving points.")
+        print(f"Fixed points: {fixed_points}")
+        print(f"Moving points: {moving_points}")
 
         if fixed_points.ndim != 2 or moving_points.ndim != 2:
             show_error("Correction point layers must contain coordinate arrays.")
