@@ -1,5 +1,6 @@
 import napari
 import re
+import textwrap
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import cast
@@ -16,6 +17,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
     QComboBox
@@ -23,6 +25,7 @@ from qtpy.QtWidgets import (
 
 from .gui import (
     LocalFolderTree,
+    ZarrImageViewer,
 )
 
 from atlas.io import extract_s_number
@@ -41,11 +44,13 @@ AXIAL_PIXEL_SIZE = 0.300
 AXIAL_PIXEL_SIZE_UNITS = "µm" #drop down, nm and micron
 AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
 DOWNSCALE = 10
+ZALIGN_STATUS_MAX_CHARS = 120
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
         self.viewer = viewer
+        self.zarr_viewer = ZarrImageViewer(viewer)
         self.main_directory = Path.cwd()
         self.pixel_size = {}
 
@@ -132,19 +137,66 @@ class AtlasCCIWidget(QWidget):
         self.pixel_size_input_widget.setLayout(self.pixel_size_input)
         self.z_align_layout_pixel.addWidget(self.pixel_size_input_widget)
 
+        self.initial_zalign_layout = QHBoxLayout()
+
         self.zalign_zshift_button = QPushButton("Initial Z Alignment")
         self.zalign_zshift_button.setToolTip("Calculate Z shifts and apply a downsampled Z alignment.")
         self.zalign_zshift_button.clicked.connect(self.initial_alignement)
         self.zalign_zshift_button.setEnabled(False)
-        self.z_align_layout_pixel.addWidget(self.zalign_zshift_button)
+        self.initial_zalign_layout.addWidget(self.zalign_zshift_button)
+
+        self.zalign_preview_button = QPushButton("Preview")
+        self.zalign_preview_button.setToolTip("Display the downsampled Z alignment Zarr output.")
+        self.zalign_preview_button.clicked.connect(self.display_initial_zalign_preview)
+        self.zalign_preview_button.setEnabled(False)
+        self.initial_zalign_layout.addWidget(self.zalign_preview_button)
+
+        self.initial_zalign_widget = QWidget()
+        self.initial_zalign_widget.setLayout(self.initial_zalign_layout)
+        self.z_align_layout_pixel.addWidget(self.initial_zalign_widget)
+
+        self.correction_layout = QHBoxLayout()
+        self.correction_Z_btn = QPushButton("Enter Correction")
+        self.correction_Z_btn.setToolTip("Create points layer for Z alignment.")
+        self.correction_Z_btn.clicked.connect(self.create_correction_points_layer)
+        self.correction_Z_btn.setEnabled(False)
+
+        self.correction_apply_btn = QPushButton("Apply Correction")
+        self.correction_apply_btn.setToolTip("Apply manual Z correction to the downsampled preview Zarr output.")
+        self.correction_apply_btn.clicked.connect(self.apply_correction)
+        self.correction_apply_btn.setEnabled(False)
+
+        self.correction_layout.addWidget(self.correction_Z_btn)
+        self.correction_layout.addWidget(self.correction_apply_btn)
+        self.correction_widget = QWidget()
+        self.correction_widget.setLayout(self.correction_layout)
+        self.z_align_layout_pixel.addWidget(self.correction_widget)
+
+        self.final_zalign_layout = QHBoxLayout()
 
         self.zalign_final_button = QPushButton("Final Z Alignment")
         self.zalign_final_button.setToolTip("Apply previously calculated Z shifts to the stitched series and save as Zarr output.")
         self.zalign_final_button.clicked.connect(self.finalize_alignement)
         self.zalign_final_button.setEnabled(False)
-        self.z_align_layout_pixel.addWidget(self.zalign_final_button)
+        self.final_zalign_layout.addWidget(self.zalign_final_button)
+
+        self.zalign_view_button = QPushButton("View")
+        self.zalign_view_button.setToolTip("Display the final Z alignment Zarr output.")
+        self.zalign_view_button.clicked.connect(self.display_final_zalign_output)
+        self.zalign_view_button.setEnabled(False)
+        self.final_zalign_layout.addWidget(self.zalign_view_button)
+
+        self.final_zalign_widget = QWidget()
+        self.final_zalign_widget.setLayout(self.final_zalign_layout)
+        self.z_align_layout_pixel.addWidget(self.final_zalign_widget)
 
         self.zalign_status_label = QLabel("Z Align: [UNPROCESSED] Idle")
+        self.zalign_status_label.setWordWrap(True)
+        self.zalign_status_label.setMinimumWidth(0)
+        self.zalign_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.z_align_layout_pixel.addWidget(self.zalign_status_label)
         self._set_zalign_status("UNPROCESSED", "Idle", UNPROCESSED)
 
@@ -323,9 +375,16 @@ class AtlasCCIWidget(QWidget):
     def _has_z_alignment_results(self, root_folder: Path) -> bool:
         return root_folder.joinpath("alignment_results", "z_alignment_results.pkl").exists()
 
-    def _has_aligned_zarr_output(self, root_folder: Path) -> bool:
+    def _zarr_output_path(self, root_folder: Path, use_downsample: bool) -> Path:
         expected_base = root_folder.name
-        return root_folder.joinpath(f"{expected_base}.zarr").exists()
+        suffix = "_downsample" if use_downsample else ""
+        return root_folder.joinpath(f"{expected_base}{suffix}.zarr")
+
+    def _has_preview_zarr_output(self, root_folder: Path) -> bool:
+        return self._zarr_output_path(root_folder, use_downsample=True).exists()
+
+    def _has_aligned_zarr_output(self, root_folder: Path) -> bool:
+        return self._zarr_output_path(root_folder, use_downsample=False).exists()
 
     def _all_series_processed(self, root_folder: Path) -> bool:
         root_item = self.local_folder_tree.topLevelItem(0)
@@ -355,6 +414,7 @@ class AtlasCCIWidget(QWidget):
 
         all_processed = self._all_series_processed(root_folder)
         has_zcalc = self._has_z_alignment_results(root_folder)
+        has_preview_zarr = self._has_preview_zarr_output(root_folder)
         has_zarr = self._has_aligned_zarr_output(root_folder)
 
         if has_zarr:
@@ -383,16 +443,22 @@ class AtlasCCIWidget(QWidget):
                 f"State: {project_state_label} {project_state_details}\n"
                 f"all stitched: {'yes' if all_processed else 'no'}\n"
                 f"z_alignment_results.pkl: {'yes' if has_zcalc else 'no'}\n"
+                f"preview zarr output: {'yes' if has_preview_zarr else 'no'}\n"
                 f"zarr output: {'yes' if has_zarr else 'no'}"
             ),
         )
 
         if not self._is_zalign_running():
             self.zalign_zshift_button.setEnabled(all_processed)
+            self.zalign_preview_button.setEnabled(has_preview_zarr)
+            self.correction_Z_btn.setEnabled(has_zcalc)
+            self.correction_apply_btn.setEnabled(has_zcalc)
             self.zalign_final_button.setEnabled(has_zcalc)
+            self.zalign_view_button.setEnabled(has_zarr)
             self._update_zalign_status_from_outputs(
                 all_processed=all_processed,
                 has_zcalc=has_zcalc,
+                has_preview_zarr=has_preview_zarr,
                 has_zarr=has_zarr,
             )
 
@@ -533,17 +599,27 @@ class AtlasCCIWidget(QWidget):
         return self._zalign_future is not None and not self._zalign_future.done()
 
     def _set_zalign_status(self, state: str, details: str, color: QColor) -> None:
-        self.zalign_status_label.setText(f"Z Align: [{state}] {details}")
+        full_text = f"Z Align: [{state}] {details}"
+        compact_details = textwrap.shorten(
+            " ".join(str(details).split()),
+            width=ZALIGN_STATUS_MAX_CHARS,
+            placeholder="...",
+        )
+        self.zalign_status_label.setText(f"Z Align: [{state}] {compact_details}")
+        self.zalign_status_label.setToolTip(full_text)
         self.zalign_status_label.setStyleSheet(f"color: {color.name()}; font-weight: 600;")
 
     def _update_zalign_status_from_outputs(
         self,
         all_processed: bool,
         has_zcalc: bool,
+        has_preview_zarr: bool,
         has_zarr: bool,
     ) -> None:
         if has_zarr:
             self._set_zalign_status("PROCESSED", "Final Z alignment complete", PROCESSED)
+        elif has_preview_zarr:
+            self._set_zalign_status("PROCESSED", "Preview Z alignment complete; final alignment ready", PROCESSED)
         elif has_zcalc:
             self._set_zalign_status("PENDING", "Initial Z alignment complete; final alignment ready", PENDING)
         elif all_processed:
@@ -553,9 +629,15 @@ class AtlasCCIWidget(QWidget):
 
     def _set_zalign_buttons_busy(self) -> None:
         self.zalign_zshift_button.setEnabled(False)
+        self.zalign_preview_button.setEnabled(False)
+        self.correction_Z_btn.setEnabled(False)
+        self.correction_apply_btn.setEnabled(False)
         self.zalign_final_button.setEnabled(False)
+        self.zalign_view_button.setEnabled(False)
         if self._zalign_active_action == "initial":
             self._set_zalign_status("ONGOING", "Running initial Z alignment", ONGOING)
+        elif self._zalign_active_action == "correction":
+            self._set_zalign_status("ONGOING", "Applying manual Z correction preview", ONGOING)
         elif self._zalign_active_action == "final":
             self._set_zalign_status("ONGOING", "Running final Z alignment", ONGOING)
         self._zalign_spinner_index = 0
@@ -565,7 +647,11 @@ class AtlasCCIWidget(QWidget):
     def _reset_zalign_buttons_idle(self) -> None:
         self._zalign_timer.stop()
         self.zalign_zshift_button.setText("Initial Z Alignment")
+        self.zalign_preview_button.setText("Preview")
+        self.correction_Z_btn.setText("Enter Correction")
+        self.correction_apply_btn.setText("Apply Correction")
         self.zalign_final_button.setText("Final Z Alignment")
+        self.zalign_view_button.setText("View")
         self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
 
     def _update_zalign_busy_text(self) -> None:
@@ -574,10 +660,22 @@ class AtlasCCIWidget(QWidget):
 
         if self._zalign_active_action == "initial":
             self.zalign_zshift_button.setText(f"Initial Z Alignment {frame}")
+            self.zalign_preview_button.setText("Preview")
+            self.correction_apply_btn.setText("Apply Correction")
             self.zalign_final_button.setText("Final Z Alignment")
+            self.zalign_view_button.setText("View")
+        elif self._zalign_active_action == "correction":
+            self.correction_apply_btn.setText(f"Apply Correction {frame}")
+            self.zalign_zshift_button.setText("Initial Z Alignment")
+            self.zalign_preview_button.setText("Preview")
+            self.zalign_final_button.setText("Final Z Alignment")
+            self.zalign_view_button.setText("View")
         elif self._zalign_active_action == "final":
             self.zalign_final_button.setText(f"Final Z Alignment {frame}")
             self.zalign_zshift_button.setText("Initial Z Alignment")
+            self.zalign_preview_button.setText("Preview")
+            self.correction_apply_btn.setText("Apply Correction")
+            self.zalign_view_button.setText("View")
 
     def _poll_zalign_future(self) -> None:
         future = self._zalign_future
@@ -606,7 +704,7 @@ class AtlasCCIWidget(QWidget):
             show_error(message)
             return
 
-        if action in {"initial", "final"}:
+        if action in {"initial", "correction", "final"}:
             typed_payload = cast(dict[str, str | float | list[str]], payload if isinstance(payload, dict) else {})
             if action == "initial":
                 axial_value = typed_payload.get("Axial")
@@ -624,11 +722,18 @@ class AtlasCCIWidget(QWidget):
                 show_error(finalize_message)
                 self.update_series_status_indicators(Path(self.main_directory))
                 return
+            self.update_series_status_indicators(Path(self.main_directory))
             if action == "initial":
                 self._set_zalign_status("PROCESSED", "Initial Z alignment complete", PROCESSED)
+            elif action == "correction":
+                points_count = int(cast(float, typed_payload.get("points_count", 0)))
+                self._set_zalign_status(
+                    "PROCESSED",
+                    f"Manual correction preview applied from {points_count} point pairs",
+                    PROCESSED,
+                )
             else:
                 self._set_zalign_status("PROCESSED", "Final Z alignment complete", PROCESSED)
-            self.update_series_status_indicators(Path(self.main_directory))
 
     def _get_series_path_from_item(self, item) -> Path | None:
         """Read canonical series path from tree item data, with tooltip fallback."""
@@ -872,14 +977,14 @@ class AtlasCCIWidget(QWidget):
             if z_axis != 0:
                 data = np.moveaxis(data, z_axis, 0)
 
-        output_name = f"{root_folder.name}{'_downsample' if use_downsample else ''}.zarr"
-        ome_zarr_path = root_folder.joinpath(output_name)
-        if ome_zarr_path.exists():
-            shutil.rmtree(ome_zarr_path)
+        ome_zarr_path = self._zarr_output_path(root_folder, use_downsample=use_downsample)
+        temp_ome_zarr_path = ome_zarr_path.with_name(f"{ome_zarr_path.name}.tmp")
+        if temp_ome_zarr_path.exists():
+            shutil.rmtree(temp_ome_zarr_path)
 
-        location = parse_url(str(ome_zarr_path), mode="w")
+        location = parse_url(str(temp_ome_zarr_path), mode="w")
         if location is None:
-            return False, f"Could not create OME-Zarr store at {ome_zarr_path}", None
+            return False, f"Could not create OME-Zarr store at {temp_ome_zarr_path}", None
 
         root_group = zarr.group(store=location.store)
 
@@ -906,7 +1011,7 @@ class AtlasCCIWidget(QWidget):
             storage_options={"chunks": chunk_shape},
         )
 
-        print(f"Wrote OME-Zarr pyramid: {ome_zarr_path}")
+        print(f"Wrote OME-Zarr pyramid: {temp_ome_zarr_path}")
 
         multiscales = root_group.attrs.get("multiscales", [])
         if not multiscales:
@@ -915,6 +1020,10 @@ class AtlasCCIWidget(QWidget):
         datasets = multiscales[0].get("datasets", [])
         if not datasets:
             return False, "OME-Zarr file was written, but no pyramid datasets were found.", None
+
+        if ome_zarr_path.exists():
+            shutil.rmtree(ome_zarr_path)
+        temp_ome_zarr_path.rename(ome_zarr_path)
 
         if np.issubdtype(data.dtype, np.integer):
             p_low, p_high = np.percentile(data, [1.0, 99.8])
@@ -961,35 +1070,55 @@ class AtlasCCIWidget(QWidget):
 
         return True, "", {**prepare_payload, **apply_payload}
 
-    def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
-        import dask.array as da
+    def _apply_correction_worker(
+        self,
+        root_folder: Path,
+        fixed_points: np.ndarray,
+        moving_points: np.ndarray,
+    ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
+        from atlas.alignment import correct_z_alignment_from_points
+        import shutil
 
+        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        if not z_align_df_path.exists():
+            return False, "Z alignment results not found. Please run initial Z alignment first.", None
+
+        z_align_df = pd.read_pickle(z_align_df_path)
+        corrected_z_align_df = correct_z_alignment_from_points(
+            z_align_df,
+            fixed_points,
+            moving_points,
+        )
+        if corrected_z_align_df is None:
+            corrected_z_align_df = z_align_df
+
+        backup_path = z_align_df_path.with_name("z_alignment_results_before_manual_correction.pkl")
+        if not backup_path.exists():
+            shutil.copy2(z_align_df_path, backup_path)
+
+        corrected_z_align_df.to_pickle(z_align_df_path)
+
+        apply_success, apply_message, apply_payload = self._apply_z_shifts_worker(
+            root_folder,
+            use_downsample=True,
+        )
+        if not apply_success or apply_payload is None:
+            return False, apply_message, None
+
+        return True, "", {**apply_payload, "points_count": float(len(fixed_points))}
+
+    def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
         try:
             ome_zarr_path = Path(str(payload.get("ome_zarr_path", "")))
-            dataset_paths_obj = payload.get("dataset_paths", [])
-            if not isinstance(dataset_paths_obj, list):
-                return False, "Invalid dataset list in Z alignment output."
-
-            dataset_paths = [str(path) for path in dataset_paths_obj]
             layer_name = str(payload.get("layer_name", "aligned"))
             p_low = float(str(payload.get("p_low", 0.0)))
             p_high = float(str(payload.get("p_high", 1.0)))
 
-            pyramid = [
-                da.from_zarr(str(ome_zarr_path.joinpath(dataset_path)))
-                for dataset_path in dataset_paths
-            ]
-
-            if layer_name in self.viewer.layers:
-                self.viewer.layers.remove(self.viewer.layers[layer_name])
-
-            self.viewer.add_image(
-                pyramid,
-                multiscale=True,
-                name=layer_name,
+            return self.zarr_viewer.display_ome_zarr(
+                ome_zarr_path,
+                layer_name=layer_name,
                 contrast_limits=(p_low, p_high),
             )
-            return True, ""
         except Exception as exc:
             return False, f"Failed to display aligned image: {exc}"
     
@@ -1055,3 +1184,184 @@ class AtlasCCIWidget(QWidget):
             False,
         )
         self._set_zalign_buttons_busy()
+
+    def _display_zalign_zarr(self, use_downsample: bool) -> None:
+        root_folder = Path(self.main_directory)
+        zarr_path = self._zarr_output_path(root_folder, use_downsample=use_downsample)
+        if not zarr_path.exists():
+            output_type = "preview" if use_downsample else "final"
+            show_error(f"No {output_type} Z alignment Zarr output found.")
+            self.update_series_status_indicators(root_folder)
+            return
+
+        success, message = self.zarr_viewer.display_ome_zarr(
+            zarr_path,
+            layer_name=root_folder.name + ("_downsample" if use_downsample else ""),
+        )
+        if not success:
+            self._set_zalign_status("FAILED", message, FAILED)
+            show_error(message)
+            return
+
+        self.update_series_status_indicators(root_folder)
+        if use_downsample:
+            self._set_zalign_status("PROCESSED", "Preview Z alignment displayed", PROCESSED)
+        else:
+            self._set_zalign_status("PROCESSED", "Final Z alignment displayed", PROCESSED)
+
+    def display_initial_zalign_preview(self) -> None:
+        self._display_zalign_zarr(use_downsample=True)
+
+    def display_final_zalign_output(self) -> None:
+        self._display_zalign_zarr(use_downsample=False)
+
+    def _remove_zalign_image_layer(self, use_downsample: bool) -> None:
+        root_folder = Path(self.main_directory)
+        layer_name = root_folder.name + ("_downsample" if use_downsample else "")
+        if self.zarr_viewer.remove_layer(layer_name):
+            QApplication.processEvents()
+
+    def _get_viewer_layer(self, name: str):
+        for layer in self.viewer.layers:
+            if layer.name == name:
+                return layer
+        return None
+
+    def _is_points_layer(self, layer) -> bool:
+        return layer.__class__.__name__ == "Points"
+
+    def _viewer_ndim(self) -> int:
+        active_layer = self.viewer.layers.selection.active
+        if active_layer is not None and hasattr(active_layer, "ndim"):
+            return int(active_layer.ndim)
+        return int(self.viewer.dims.ndim)
+
+    def _set_points_layer_style(self, layer, face_color: str) -> None:
+        layer.size = 8
+        layer.face_color = face_color
+        if hasattr(layer, "border_color"):
+            layer.border_color = "black"
+        elif hasattr(layer, "edge_color"):
+            layer.edge_color = "black"
+
+    def _add_empty_points_layer(self, name: str, face_color: str):
+        ndim = self._viewer_ndim()
+        add_kwargs = {
+            "data": None,
+            "ndim": ndim,
+            "name": name,
+            "size": 8,
+            "face_color": face_color,
+            "border_color": "black",
+        }
+        try:
+            return self.viewer.add_points(**add_kwargs)
+        except TypeError:
+            add_kwargs.pop("border_color", None)
+            add_kwargs["edge_color"] = "black"
+            try:
+                return self.viewer.add_points(**add_kwargs)
+            except TypeError:
+                add_kwargs.pop("edge_color", None)
+                try:
+                    return self.viewer.add_points(**add_kwargs)
+                except TypeError:
+                    add_kwargs.pop("ndim", None)
+                    add_kwargs["data"] = np.empty((0, ndim))
+                    return self.viewer.add_points(**add_kwargs)
+
+    def _get_or_create_correction_points_layer(
+        self,
+        name: str,
+        face_color: str,
+    ):
+        layer = self._get_viewer_layer(name)
+        if layer is None:
+            layer = self._add_empty_points_layer(name, face_color)
+        else:
+            if not self._is_points_layer(layer):
+                show_error(f"Layer '{name}' already exists but is not a Points layer.")
+                return None
+            self._set_points_layer_style(layer, face_color)
+
+        layer.mode = "add"
+        return layer
+
+    def create_correction_points_layer(self) -> None:
+        root_folder = Path(self.main_directory)
+        if not self._has_z_alignment_results(root_folder):
+            show_error("Z alignment results not found. Please run initial Z alignment first.")
+            self.update_series_status_indicators(root_folder)
+            return
+
+        fixed_layer = self._get_or_create_correction_points_layer(
+            "Fixed Points",
+            "red",
+        )
+        moving_layer = self._get_or_create_correction_points_layer(
+            "Moving Points",
+            "blue",
+        )
+        if fixed_layer is None or moving_layer is None:
+            return
+
+        self.viewer.layers.selection.active = fixed_layer
+        self._set_zalign_status(
+            "PENDING",
+            "Add matching points in Fixed Points and Moving Points, then apply correction",
+            PENDING,
+        )
+
+    def apply_correction(self) -> None:
+        if self._is_zalign_running():
+            show_error("A Z alignment task is already running.")
+            return
+
+        root_folder = Path(self.main_directory)
+        if not self._has_z_alignment_results(root_folder):
+            show_error("Z alignment results not found. Please run initial Z alignment first.")
+            self.update_series_status_indicators(root_folder)
+            return
+
+        fixed_layer = self._get_viewer_layer("Fixed Points")
+        moving_layer = self._get_viewer_layer("Moving Points")
+        if fixed_layer is None or moving_layer is None:
+            show_error("Create correction point layers before applying correction.")
+            return
+        if not self._is_points_layer(fixed_layer) or not self._is_points_layer(moving_layer):
+            show_error("Fixed Points and Moving Points must be napari Points layers.")
+            return
+
+        fixed_points = np.asarray(fixed_layer.data, dtype=float)
+        moving_points = np.asarray(moving_layer.data, dtype=float)
+
+        if fixed_points.ndim != 2 or moving_points.ndim != 2:
+            show_error("Correction point layers must contain coordinate arrays.")
+            return
+
+        if len(fixed_points) == 0:
+            show_error("Add at least one correction point pair before applying correction.")
+            return
+
+        if len(fixed_points) != len(moving_points):
+            show_error("The number of points in the Fixed Points layer and the Moving Points layer must be the same.")
+            return
+
+        if fixed_points.shape != moving_points.shape:
+            show_error("Fixed and Moving correction points must have the same dimensionality.")
+            return
+
+        self._remove_zalign_image_layer(use_downsample=True)
+
+        self._zalign_active_action = "correction"
+        self._zalign_future = self._zalign_executor.submit(
+            self._apply_correction_worker,
+            root_folder,
+            fixed_points.copy(),
+            moving_points.copy(),
+        )
+        self._set_zalign_buttons_busy()
+
+        #delete the points layers after applying correction
+        self.viewer.layers.remove(fixed_layer)
+        self.viewer.layers.remove(moving_layer)

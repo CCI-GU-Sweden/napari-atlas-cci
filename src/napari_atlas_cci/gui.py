@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import QAbstractItemView, QTreeWidget, QTreeWidgetItem
@@ -30,3 +31,57 @@ class LocalFolderTree(QTreeWidget):
         self.addTopLevelItem(root_item)
         root_item.setExpanded(True)
         self.resizeColumnToContents(0)
+
+
+class ZarrImageViewer:
+    def __init__(self, viewer: Any):
+        self.viewer = viewer
+
+    def remove_layer(self, layer_name: str) -> bool:
+        for layer in list(self.viewer.layers):
+            if layer.name == layer_name:
+                self.viewer.layers.remove(layer)
+                return True
+        return False
+
+    def display_ome_zarr(
+        self,
+        ome_zarr_path: Path,
+        layer_name: str | None = None,
+        contrast_limits: tuple[float, float] | None = None,
+    ) -> tuple[bool, str]:
+        import dask.array as da
+        import zarr
+
+        if not ome_zarr_path.exists():
+            return False, f"Zarr output not found: {ome_zarr_path}"
+
+        try:
+            root_group = zarr.open_group(str(ome_zarr_path), mode="r")
+            multiscales = root_group.attrs.get("multiscales", [])
+            if not multiscales:
+                return False, "Zarr output has no multiscales metadata."
+
+            datasets = multiscales[0].get("datasets", [])
+            if not datasets:
+                return False, "Zarr output has no pyramid datasets."
+
+            pyramid = [
+                da.from_zarr(str(ome_zarr_path.joinpath(str(dataset["path"]))))
+                for dataset in datasets
+            ]
+            display_name = layer_name or ome_zarr_path.stem
+
+            self.remove_layer(display_name)
+
+            add_kwargs = {
+                "multiscale": True,
+                "name": display_name,
+            }
+            if contrast_limits is not None:
+                add_kwargs["contrast_limits"] = contrast_limits
+
+            self.viewer.add_image(pyramid, **add_kwargs)
+            return True, ""
+        except Exception as exc:
+            return False, f"Failed to display Zarr output: {exc}"
