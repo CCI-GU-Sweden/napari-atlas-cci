@@ -8,6 +8,7 @@ import tifffile as tiff
 import pandas as pd
 import numpy as np
 from napari.utils.notifications import show_error
+from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QBrush, QColor, QDoubleValidator
 from qtpy.QtWidgets import (
@@ -25,6 +26,8 @@ from qtpy.QtWidgets import (
 
 from .gui import (
     LocalFolderTree,
+    OptionsDialog,
+    UploadDataDialog,
     ZarrImageViewer,
 )
 
@@ -89,6 +92,10 @@ class AtlasCCIWidget(QWidget):
         self.browse_btn = QPushButton("Browse...")
         self.browse_btn.clicked.connect(self.browse_for_atlas_project)
         self.path_layout.addWidget(self.browse_btn)
+
+        self.options_button = QPushButton("Options...")
+        self.options_button.clicked.connect(self.open_options_dialog)
+        self.path_layout.addWidget(self.options_button)
 
         self.main_layout.addLayout(self.path_layout)
 
@@ -201,6 +208,24 @@ class AtlasCCIWidget(QWidget):
         self._set_zalign_status("UNPROCESSED", "Idle", UNPROCESSED)
 
         self.main_layout.addLayout(self.z_align_layout_pixel)
+
+        self.export_layout = QHBoxLayout()
+
+        self.export_czi_button = QPushButton("Export to CZI")
+        self.export_czi_button.setToolTip("Export the final Z alignment Zarr output to CZI format.")
+        self.export_czi_button.clicked.connect(self.export_to_czi)
+        self.export_czi_button.setEnabled(False)
+        self.export_layout.addWidget(self.export_czi_button)
+
+        self.upload_wkn_button = QPushButton("Upload to Webknossos...")
+        self.upload_wkn_button.setToolTip("Upload the final Z alignment Zarr output to Webknossos.")
+        self.upload_wkn_button.clicked.connect(self.upload_to_webknossos)
+        self.upload_wkn_button.setEnabled(False)
+        self.export_layout.addWidget(self.upload_wkn_button)
+
+        self.export_widget = QWidget()
+        self.export_widget.setLayout(self.export_layout)
+        self.main_layout.addWidget(self.export_widget)
 
         self.refresh_local_folder_tree()
 
@@ -455,6 +480,8 @@ class AtlasCCIWidget(QWidget):
             self.correction_apply_btn.setEnabled(has_zcalc)
             self.zalign_final_button.setEnabled(has_zcalc)
             self.zalign_view_button.setEnabled(has_zarr)
+            self.export_czi_button.setEnabled(has_zarr)
+            self.upload_wkn_button.setEnabled(has_zarr)
             self._update_zalign_status_from_outputs(
                 all_processed=all_processed,
                 has_zcalc=has_zcalc,
@@ -634,6 +661,8 @@ class AtlasCCIWidget(QWidget):
         self.correction_apply_btn.setEnabled(False)
         self.zalign_final_button.setEnabled(False)
         self.zalign_view_button.setEnabled(False)
+        self.export_czi_button.setEnabled(False)
+        self.upload_wkn_button.setEnabled(False)
         if self._zalign_active_action == "initial":
             self._set_zalign_status("ONGOING", "Running initial Z alignment", ONGOING)
         elif self._zalign_active_action == "correction":
@@ -653,6 +682,31 @@ class AtlasCCIWidget(QWidget):
         self.zalign_final_button.setText("Final Z Alignment")
         self.zalign_view_button.setText("View")
         self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
+
+    def open_options_dialog(self) -> None:
+        dialog = OptionsDialog(self)
+        dialog.set_values(
+            {
+                "thread_count": THREAD_COUNT,
+                "max_shift_pixels": MAX_SHIFT_PIXELS,
+                "downsampling_factor": DOWNSCALE,
+            }
+        )
+        dialog.options_applied.connect(self.apply_options)
+        self._exec_dialog(dialog)
+
+    def apply_options(self, values: dict) -> None:
+        global THREAD_COUNT, MAX_SHIFT_PIXELS, DOWNSCALE
+
+        THREAD_COUNT = int(values["thread_count"])
+        MAX_SHIFT_PIXELS = int(values["max_shift_pixels"])
+        DOWNSCALE = int(values["downsampling_factor"])
+        show_info("Atlas CCI options updated.")
+
+    def _exec_dialog(self, dialog) -> int:
+        if hasattr(dialog, "exec"):
+            return int(dialog.exec())
+        return int(dialog.exec_())
 
     def _update_zalign_busy_text(self) -> None:
         frame = self._zalign_spinner_frames[self._zalign_spinner_index]
@@ -1399,3 +1453,173 @@ class AtlasCCIWidget(QWidget):
         #delete the points layers after applying correction
         self.viewer.layers.remove(fixed_layer)
         self.viewer.layers.remove(moving_layer)
+
+    def _final_zarr_path(self) -> Path:
+        return self._zarr_output_path(Path(self.main_directory), use_downsample=False)
+
+    def _aligned_czi_path(self) -> Path:
+        root_folder = Path(self.main_directory)
+        return root_folder.joinpath(f"{root_folder.name}_aligned.czi")
+
+    def _ome_zarr_dataset_path(self, ome_zarr_path: Path, level: int = 0) -> Path:
+        import zarr
+
+        root_group = zarr.open_group(str(ome_zarr_path), mode="r")
+        multiscales = root_group.attrs.get("multiscales", [])
+        if not multiscales:
+            raise ValueError("Zarr output has no multiscales metadata.")
+
+        datasets = multiscales[0].get("datasets", [])
+        if not datasets:
+            raise ValueError("Zarr output has no pyramid datasets.")
+        if level >= len(datasets):
+            raise ValueError(f"Zarr output has no pyramid level {level}.")
+
+        return ome_zarr_path.joinpath(str(datasets[level]["path"]))
+
+    def _axial_pixel_size_nm(self) -> float:
+        axial_value = float(self.axial_pixel_size_input.text())
+        axial_unit = self.axial_pixel_unit_dropdown.currentText()
+        if axial_unit == "µm":
+            return axial_value * 1000.0
+        return axial_value
+
+    def export_to_czi(self) -> Path | None:
+        from pylibCZIrw import czi as pyczi
+        import zarr
+
+        zarr_path = self._final_zarr_path()
+        if not zarr_path.exists():
+            show_error("Final Z alignment Zarr output not found.")
+            return None
+
+        if not self.update_pixel_size_from_input():
+            return None
+
+        try:
+            dataset_path = self._ome_zarr_dataset_path(zarr_path)
+            zarr_array = zarr.open_array(str(dataset_path), mode="r")
+            if len(zarr_array.shape) != 3:
+                raise ValueError(f"Expected a 3D OME-Zarr dataset, got shape {zarr_array.shape}")
+
+            czi_path = self._aligned_czi_path()
+            pix_xy = float(self.pixel_size.get("Value", 1.0))
+            pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
+
+            with pyczi.create_czi(czi_path, exist_ok=True) as czidoc_w:
+                for frame in range(zarr_array.shape[0]):
+                    tmp_plane = np.asarray(zarr_array[frame, :, :]).squeeze()
+                    czidoc_w.write(data=tmp_plane[..., np.newaxis], plane={"Z": frame})
+
+                czidoc_w.write_metadata(
+                    document_name=czi_path.stem,
+                    channel_names={0: "White"},
+                    scale_x=pix_xy * 10 ** -6,
+                    scale_y=pix_xy * 10 ** -6,
+                    scale_z=pix_z * 10 ** -6,
+                )
+        except Exception as exc:
+            show_error(f"Failed to export CZI: {exc}")
+            return None
+
+        show_info(f"Exported CZI: {czi_path}")
+        return czi_path
+
+    def upload_to_webknossos(self) -> None:
+        final_zarr_path = self._final_zarr_path()
+        if not final_zarr_path.exists():
+            show_error("Final Z alignment Zarr output not found.")
+            return
+
+        if not self.update_pixel_size_from_input():
+            return
+
+        dialog = UploadDataDialog(self)
+        dialog.set_values(
+            {
+                "xy_pixel_size": 1.0,
+                "z_pixel_size": self._axial_pixel_size_nm(),
+                "dataset_name": Path(self.main_directory).name,
+                "wkn_token": "",
+            }
+        )
+        dialog.upload_requested.connect(self._upload_to_webknossos)
+        self._exec_dialog(dialog)
+
+    def _upload_to_webknossos(self, values: dict) -> None:
+        import dask.array as da
+        import tempfile
+        from upath import UPath
+        from webknossos import Dataset, webknossos_context
+        from webknossos.cli.convert_zarr import convert_zarr
+        from webknossos.dataset.defaults import DEFAULT_CHUNK_SHAPE, DEFAULT_SHARD_SHAPE
+        from webknossos.dataset.sampling_modes import SamplingModes
+        from webknossos.dataset_properties import DataFormat, VoxelSize
+        from webknossos.geometry.mag import Mag
+
+        token = str(values.get("wkn_token", "")).strip()
+        dataset_name = str(values.get("dataset_name", "")).strip()
+        if not token:
+            show_error("Please provide a WebKnossos API token.")
+            return
+        if not dataset_name:
+            show_error("Please provide a WebKnossos dataset name.")
+            return
+
+        final_zarr_path = self._final_zarr_path()
+        if not final_zarr_path.exists():
+            show_error("Final Z alignment Zarr output not found.")
+            return
+
+        voxel_size = (
+            1.0,
+            1.0,
+            float(values.get("z_pixel_size", self._axial_pixel_size_nm())),
+        )
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="atlas_cci_wk_") as temp_dir:
+                temp_root = Path(temp_dir)
+                upload_source_path = temp_root.joinpath(f"{dataset_name}_source.zarr")
+                output_path = temp_root.joinpath(dataset_name)
+
+                dataset_path = self._ome_zarr_dataset_path(final_zarr_path)
+                source_array = da.from_zarr(str(dataset_path))
+                if source_array.ndim != 3:
+                    raise ValueError(f"Expected 3D Zarr data, got shape {source_array.shape}.")
+
+                # OME-Zarr is written as zyx. WebKnossos conversion expects xyz.
+                da.to_zarr(
+                    source_array.transpose(2, 1, 0),
+                    str(upload_source_path),
+                    overwrite=True,
+                )
+
+                with webknossos_context(token=token):
+                    convert_zarr(
+                        source_zarr_path=UPath(upload_source_path),
+                        target_path=UPath(output_path),
+                        layer_name="color",
+                        data_format=DataFormat.Zarr3,
+                        chunk_shape=DEFAULT_CHUNK_SHAPE,
+                        shard_shape=DEFAULT_SHARD_SHAPE,
+                        is_segmentation_layer=False,
+                        voxel_size_with_unit=VoxelSize(voxel_size),
+                        compress=True,
+                    )
+
+                    dataset = Dataset(output_path, voxel_size=voxel_size, exist_ok=True)
+                    dataset.downsample(
+                        sampling_mode=SamplingModes.ANISOTROPIC,
+                        coarsest_mag=Mag(32),
+                    )
+
+                    print(f"Uploading dataset to WebKnossos from {output_path}...")
+                    remote_dataset = dataset.upload()
+                    show_info(f"Successfully uploaded {remote_dataset.url}")
+                    print(f"Successfully uploaded {remote_dataset.url}")
+        except Exception as exc:
+            show_error(f"Failed to upload to WebKnossos: {exc}")
+            return
+
+        self.update_series_status_indicators(Path(self.main_directory))

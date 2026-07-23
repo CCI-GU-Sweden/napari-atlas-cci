@@ -29,7 +29,9 @@ dependencies = [
     "qtpy",
     "scipy",
     "ome-zarr",
-    "dask"
+    "dask",
+    "webknossos",
+    "pylibCZIrw"
 ]
 
 [project.optional-dependencies]
