@@ -18,7 +18,6 @@ from qtpy.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
-    QRadioButton,
     QComboBox
 )
 
@@ -41,7 +40,7 @@ MAX_SHIFT_PIXELS = 500  # Maximum shift in pixels for stitching (if applicable)
 AXIAL_PIXEL_SIZE = 0.300
 AXIAL_PIXEL_SIZE_UNITS = "µm" #drop down, nm and micron
 AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
-DOWNSCALE = 20
+DOWNSCALE = 10
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
@@ -82,7 +81,7 @@ class AtlasCCIWidget(QWidget):
         self.path_edit.setText(str(self.main_directory))
         self.path_layout.addWidget(self.path_edit)
 
-        self.browse_btn = QPushButton("Browse")
+        self.browse_btn = QPushButton("Browse...")
         self.browse_btn.clicked.connect(self.browse_for_atlas_project)
         self.path_layout.addWidget(self.browse_btn)
 
@@ -133,18 +132,17 @@ class AtlasCCIWidget(QWidget):
         self.pixel_size_input_widget.setLayout(self.pixel_size_input)
         self.z_align_layout_pixel.addWidget(self.pixel_size_input_widget)
 
-        self.rough_zalign_radio_btn = QRadioButton("Rough Z Alignment")
-        self.z_align_layout_pixel.addWidget(self.rough_zalign_radio_btn)
-
-        self.zalign_zshift_button = QPushButton("Calculate Z Shifts")
-        self.zalign_zshift_button.clicked.connect(self.prepare_alignement)
+        self.zalign_zshift_button = QPushButton("Initial Z Alignment")
+        self.zalign_zshift_button.setToolTip("Calculate Z shifts and apply a downsampled Z alignment.")
+        self.zalign_zshift_button.clicked.connect(self.initial_alignement)
         self.zalign_zshift_button.setEnabled(False)
         self.z_align_layout_pixel.addWidget(self.zalign_zshift_button)
 
-        self.zalign_apply_button = QPushButton("Apply Z Shifts")
-        self.zalign_apply_button.clicked.connect(self.apply_z_shifts)
-        self.zalign_apply_button.setEnabled(False)
-        self.z_align_layout_pixel.addWidget(self.zalign_apply_button)
+        self.zalign_final_button = QPushButton("Final Z Alignment")
+        self.zalign_final_button.setToolTip("Apply previously calculated Z shifts to the stitched series and save as Zarr output.")
+        self.zalign_final_button.clicked.connect(self.finalize_alignement)
+        self.zalign_final_button.setEnabled(False)
+        self.z_align_layout_pixel.addWidget(self.zalign_final_button)
 
         self.zalign_status_label = QLabel("Z Align: [UNPROCESSED] Idle")
         self.z_align_layout_pixel.addWidget(self.zalign_status_label)
@@ -327,11 +325,7 @@ class AtlasCCIWidget(QWidget):
 
     def _has_aligned_zarr_output(self, root_folder: Path) -> bool:
         expected_base = root_folder.name
-        if root_folder.joinpath(f"{expected_base}.zarr").exists():
-            return True
-        if root_folder.joinpath(f"{expected_base}_downsample.zarr").exists():
-            return True
-        return any(path.is_dir() for path in root_folder.glob("*.zarr"))
+        return root_folder.joinpath(f"{expected_base}.zarr").exists()
 
     def _all_series_processed(self, root_folder: Path) -> bool:
         root_item = self.local_folder_tree.topLevelItem(0)
@@ -395,7 +389,12 @@ class AtlasCCIWidget(QWidget):
 
         if not self._is_zalign_running():
             self.zalign_zshift_button.setEnabled(all_processed)
-            self.zalign_apply_button.setEnabled(has_zcalc)
+            self.zalign_final_button.setEnabled(has_zcalc)
+            self._update_zalign_status_from_outputs(
+                all_processed=all_processed,
+                has_zcalc=has_zcalc,
+                has_zarr=has_zarr,
+            )
 
     def update_series_status_indicators(self, root_folder: Path) -> None:
         """Update status labels/colors for each S_ child in the tree."""
@@ -537,33 +536,48 @@ class AtlasCCIWidget(QWidget):
         self.zalign_status_label.setText(f"Z Align: [{state}] {details}")
         self.zalign_status_label.setStyleSheet(f"color: {color.name()}; font-weight: 600;")
 
+    def _update_zalign_status_from_outputs(
+        self,
+        all_processed: bool,
+        has_zcalc: bool,
+        has_zarr: bool,
+    ) -> None:
+        if has_zarr:
+            self._set_zalign_status("PROCESSED", "Final Z alignment complete", PROCESSED)
+        elif has_zcalc:
+            self._set_zalign_status("PENDING", "Initial Z alignment complete; final alignment ready", PENDING)
+        elif all_processed:
+            self._set_zalign_status("PENDING", "Ready for initial Z alignment", PENDING)
+        else:
+            self._set_zalign_status("UNPROCESSED", "Waiting for 2D stitching outputs", UNPROCESSED)
+
     def _set_zalign_buttons_busy(self) -> None:
         self.zalign_zshift_button.setEnabled(False)
-        self.zalign_apply_button.setEnabled(False)
-        if self._zalign_active_action == "calculate":
-            self._set_zalign_status("ONGOING", "Calculating Z shifts", ONGOING)
-        elif self._zalign_active_action == "apply":
-            self._set_zalign_status("ONGOING", "Applying Z shifts", ONGOING)
+        self.zalign_final_button.setEnabled(False)
+        if self._zalign_active_action == "initial":
+            self._set_zalign_status("ONGOING", "Running initial Z alignment", ONGOING)
+        elif self._zalign_active_action == "final":
+            self._set_zalign_status("ONGOING", "Running final Z alignment", ONGOING)
         self._zalign_spinner_index = 0
         self._update_zalign_busy_text()
         self._zalign_timer.start()
 
     def _reset_zalign_buttons_idle(self) -> None:
         self._zalign_timer.stop()
-        self.zalign_zshift_button.setText("Calculate Z Shifts")
-        self.zalign_apply_button.setText("Apply Z Shifts")
+        self.zalign_zshift_button.setText("Initial Z Alignment")
+        self.zalign_final_button.setText("Final Z Alignment")
         self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
 
     def _update_zalign_busy_text(self) -> None:
         frame = self._zalign_spinner_frames[self._zalign_spinner_index]
         self._zalign_spinner_index = (self._zalign_spinner_index + 1) % len(self._zalign_spinner_frames)
 
-        if self._zalign_active_action == "calculate":
-            self.zalign_zshift_button.setText(f"Calculating {frame}")
-            self.zalign_apply_button.setText("Apply Z Shifts")
-        elif self._zalign_active_action == "apply":
-            self.zalign_apply_button.setText(f"Applying {frame}")
-            self.zalign_zshift_button.setText("Calculate Z Shifts")
+        if self._zalign_active_action == "initial":
+            self.zalign_zshift_button.setText(f"Initial Z Alignment {frame}")
+            self.zalign_final_button.setText("Final Z Alignment")
+        elif self._zalign_active_action == "final":
+            self.zalign_final_button.setText(f"Final Z Alignment {frame}")
+            self.zalign_zshift_button.setText("Initial Z Alignment")
 
     def _poll_zalign_future(self) -> None:
         future = self._zalign_future
@@ -592,22 +606,28 @@ class AtlasCCIWidget(QWidget):
             show_error(message)
             return
 
-        if action == "calculate":
-            if isinstance(payload, dict):
-                self.pixel_size = payload
-            self._set_zalign_status("PROCESSED", "Z shifts calculated", PROCESSED)
-            self.update_series_status_indicators(Path(self.main_directory))
-            return
-
-        if action == "apply":
+        if action in {"initial", "final"}:
             typed_payload = cast(dict[str, str | float | list[str]], payload if isinstance(payload, dict) else {})
+            if action == "initial":
+                axial_value = typed_payload.get("Axial")
+                axial_unit = typed_payload.get("Unit")
+                value = typed_payload.get("Value")
+                if isinstance(axial_value, float) and isinstance(value, float) and isinstance(axial_unit, str):
+                    self.pixel_size = {
+                        "Value": value,
+                        "Axial": axial_value,
+                        "Unit": axial_unit,
+                    }
             finalize_success, finalize_message = self._finalize_apply_z_shifts(typed_payload)
             if not finalize_success:
                 self._set_zalign_status("FAILED", finalize_message, FAILED)
                 show_error(finalize_message)
                 self.update_series_status_indicators(Path(self.main_directory))
                 return
-            self._set_zalign_status("PROCESSED", "Z shifts applied", PROCESSED)
+            if action == "initial":
+                self._set_zalign_status("PROCESSED", "Initial Z alignment complete", PROCESSED)
+            else:
+                self._set_zalign_status("PROCESSED", "Final Z alignment complete", PROCESSED)
             self.update_series_status_indicators(Path(self.main_directory))
 
     def _get_series_path_from_item(self, item) -> Path | None:
@@ -776,24 +796,6 @@ class AtlasCCIWidget(QWidget):
         z_align_df_path = output_path.joinpath("z_alignment_results.pkl")
         z_align_df.to_pickle(z_align_df_path)
 
-    def prepare_alignement(self):
-        if self._is_zalign_running():
-            show_error("A Z alignment task is already running.")
-            return
-
-        root_folder = Path(self.main_directory)
-        axial_value = self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE)
-        axial_unit = self.axial_pixel_unit_dropdown.currentText()
-
-        self._zalign_active_action = "calculate"
-        self._zalign_future = self._zalign_executor.submit(
-            self._prepare_alignement_worker,
-            root_folder,
-            float(axial_value),
-            str(axial_unit),
-        )
-        self._set_zalign_buttons_busy()
-
     def _prepare_alignement_worker(
         self,
         root_folder: Path,
@@ -833,55 +835,6 @@ class AtlasCCIWidget(QWidget):
                 "Unit": axial_unit,
             },
         )
-
-    def reorder_series(self, tif_list_sorted: list[Path]) -> list[Path]:
-        """
-        Reorder the series based on the numeric part of their names.
-        Assumes series names are in the format 'S_<number>'.
-        """
-        from atlas.io import reorder_files_by_s_number, parse_shorthand_order
-
-        correct_order_path = Path(self.main_directory).joinpath("correct_order.txt")
-
-        try:
-            new_order = parse_shorthand_order(correct_order_path)
-            print(f"Loaded correct_order.txt: {new_order}")
-
-            tif_list_sorted = reorder_files_by_s_number(tif_list_sorted, new_order)
-            print("Files reordered based on correct_order.txt:")
-            for f in tif_list_sorted:
-                print(f)
-
-        except FileNotFoundError:
-            print("No correct_order.txt found — using original order.")
-        except Exception as e:
-            print(f"Error reading or applying correct_order.txt: {e}")
-
-        return tif_list_sorted
-
-    def read_align_df(self) -> pd.DataFrame | None:
-        z_align_df_path = Path(self.main_directory).joinpath("alignment_results", "z_alignment_results.pkl")
-        if z_align_df_path.exists():
-            return pd.read_pickle(z_align_df_path)
-        else:
-            show_error("Z alignment results not found. Please run the alignment first.")
-            return None
-
-    def apply_z_shifts(self) -> None:
-        if self._is_zalign_running():
-            show_error("A Z alignment task is already running.")
-            return
-
-        root_folder = Path(self.main_directory)
-        use_downsample = self.rough_zalign_radio_btn.isChecked()
-
-        self._zalign_active_action = "apply"
-        self._zalign_future = self._zalign_executor.submit(
-            self._apply_z_shifts_worker,
-            root_folder,
-            use_downsample,
-        )
-        self._set_zalign_buttons_busy()
 
     def _apply_z_shifts_worker(
         self,
@@ -985,6 +938,29 @@ class AtlasCCIWidget(QWidget):
             },
         )
 
+    def _initial_alignement_worker(
+        self,
+        root_folder: Path,
+        axial_value: float,
+        axial_unit: str,
+    ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
+        prepare_success, prepare_message, prepare_payload = self._prepare_alignement_worker(
+            root_folder,
+            axial_value,
+            axial_unit,
+        )
+        if not prepare_success or prepare_payload is None:
+            return False, prepare_message, None
+
+        apply_success, apply_message, apply_payload = self._apply_z_shifts_worker(
+            root_folder,
+            use_downsample=True,
+        )
+        if not apply_success or apply_payload is None:
+            return False, apply_message, None
+
+        return True, "", {**prepare_payload, **apply_payload}
+
     def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
         import dask.array as da
 
@@ -1017,7 +993,7 @@ class AtlasCCIWidget(QWidget):
         except Exception as exc:
             return False, f"Failed to display aligned image: {exc}"
     
-    def update_pixel_size_from_input(self):
+    def update_pixel_size_from_input(self) -> bool:
         try:
             new_pixel_size = float(self.axial_pixel_size_input.text())
             if new_pixel_size <= 0:
@@ -1029,5 +1005,53 @@ class AtlasCCIWidget(QWidget):
                 raise ValueError(f"Invalid pixel size unit: {new_pixel_unit}")
 
             print(f"Updated axial pixel size to: {new_pixel_size} {new_pixel_unit}")
+            return True
         except ValueError as e:
             show_error(f"Invalid pixel size input: {e}")
+            return False
+
+    def initial_alignement(self):
+        if not self.update_pixel_size_from_input():
+            return
+        if self._is_zalign_running():
+            show_error("A Z alignment task is already running.")
+            return
+
+        root_folder = Path(self.main_directory)
+        if not self._all_series_processed(root_folder):
+            show_error("Initial Z alignment requires all series to be processed first.")
+            self.update_series_status_indicators(root_folder)
+            return
+
+        axial_value = self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE)
+        axial_unit = self.axial_pixel_unit_dropdown.currentText()
+
+        self._zalign_active_action = "initial"
+        self._zalign_future = self._zalign_executor.submit(
+            self._initial_alignement_worker,
+            root_folder,
+            float(axial_value),
+            str(axial_unit),
+        )
+        self._set_zalign_buttons_busy()
+
+    def finalize_alignement(self):
+        if not self.update_pixel_size_from_input():
+            return
+        if self._is_zalign_running():
+            show_error("A Z alignment task is already running.")
+            return
+
+        root_folder = Path(self.main_directory)
+        if not self._has_z_alignment_results(root_folder):
+            show_error("Z alignment results not found. Please run initial Z alignment first.")
+            self.update_series_status_indicators(root_folder)
+            return
+
+        self._zalign_active_action = "final"
+        self._zalign_future = self._zalign_executor.submit(
+            self._apply_z_shifts_worker,
+            root_folder,
+            False,
+        )
+        self._set_zalign_buttons_busy()
