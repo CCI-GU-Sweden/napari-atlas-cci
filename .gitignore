@@ -85,3 +85,4 @@ venv/
 
 
 **/test.py
+.agents/*

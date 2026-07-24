@@ -3,16 +3,19 @@ from typing import Any
 from uuid import uuid4
 import os
 
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Qt, QUrl, Signal
+from qtpy.QtGui import QDesktopServices
 from qtpy.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
-    QLabel,
+    QFormLayout,
+    QLineEdit,
+    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
-    QLineEdit,
 )
 from qtpy.QtGui import QIntValidator
 from qtpy.QtGui import QDoubleValidator
@@ -53,24 +56,37 @@ class OptionsDialog(QDialog):
         self.setWindowTitle("Atlas CCI Options")
 
         self.main_layout = QVBoxLayout(self)
+        self.form_layout = QFormLayout()
 
-        self.main_layout.addWidget(QLabel("General"))
         self.thread_count_input = QLineEdit(str(4))
         self.thread_count_input.setToolTip("Number of threads to use for processing.")
         self.thread_count_input.setValidator(QIntValidator(1, 100))
-        self.main_layout.addWidget(self.thread_count_input)
+        self.form_layout.addRow("Threads:", self.thread_count_input)
 
-        self.main_layout.addWidget(QLabel("Stitching"))
         self.max_shift_pixels_input = QLineEdit(str(500))
         self.max_shift_pixels_input.setToolTip("Maximum shift in pixels for stitching.")
         self.max_shift_pixels_input.setValidator(QIntValidator(0, 1000))
-        self.main_layout.addWidget(self.max_shift_pixels_input)
+        self.form_layout.addRow("Max shift (px):", self.max_shift_pixels_input)
 
-        self.main_layout.addWidget(QLabel("Alignment"))
         self.downsampling_factor_input = QLineEdit(str(10))
         self.downsampling_factor_input.setToolTip("Downsampling factor for alignment.")
         self.downsampling_factor_input.setValidator(QIntValidator(0, 100))
-        self.main_layout.addWidget(self.downsampling_factor_input)
+        self.form_layout.addRow("Downsampling factor:", self.downsampling_factor_input)
+
+        self.compression_enabled_input = QCheckBox()
+        self.compression_enabled_input.setToolTip("Enable ZSTD compression for CZI output.")
+        self.compression_enabled_input.setChecked(True)
+        self.compression_enabled_input.toggled.connect(
+            self._update_compression_level_enabled
+        )
+        self.form_layout.addRow("Use CZI compression:", self.compression_enabled_input)
+
+        self.compression_level_input = QLineEdit(str(3))
+        self.compression_level_input.setToolTip("Compression level for CZI output as ZSTD compression.")
+        self.compression_level_input.setValidator(QIntValidator(0, 22))
+        self.form_layout.addRow("ZSTD compression level:", self.compression_level_input)
+
+        self.main_layout.addLayout(self.form_layout)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -89,16 +105,28 @@ class OptionsDialog(QDialog):
             "thread_count": int(self.thread_count_input.text()),
             "max_shift_pixels": int(self.max_shift_pixels_input.text()),
             "downsampling_factor": int(self.downsampling_factor_input.text()),
+            "compression_enabled": self.compression_enabled_input.isChecked(),
+            "compression_level": int(self.compression_level_input.text()),
         }
 
     def set_values(self, values: dict) -> None:
         self.thread_count_input.setText(str(values.get("thread_count", 4)))
         self.max_shift_pixels_input.setText(str(values.get("max_shift_pixels", 500)))
         self.downsampling_factor_input.setText(str(values.get("downsampling_factor", 10)))
+        self.compression_enabled_input.setChecked(
+            bool(values.get("compression_enabled", True))
+        )
+        self.compression_level_input.setText(str(values.get("compression_level", 3)))
+        self._update_compression_level_enabled(
+            self.compression_enabled_input.isChecked()
+        )
 
     def _accept_options(self) -> None:
         self.options_applied.emit(self.values())
         self.accept()
+
+    def _update_compression_level_enabled(self, enabled: bool) -> None:
+        self.compression_level_input.setEnabled(enabled)
 
 
 class UploadDataDialog(QDialog):
@@ -109,27 +137,26 @@ class UploadDataDialog(QDialog):
         self.setWindowTitle("Upload Data to Webknossos")
 
         self.main_layout = QVBoxLayout(self)
-        token_link = QLabel(
-            '<a href="https://webknossos.org/account/token">'
-            "Create or copy your WebKnossos token"
-            "</a>"
-        )
-        token_link.setOpenExternalLinks(True)
-        self.main_layout.addWidget(token_link)
+        self.token_button = QPushButton("Open WebKnossos token page")
+        self.token_button.setToolTip("Open the WebKnossos account token page in your browser.")
+        self.token_button.clicked.connect(self._open_webknossos_token_page)
+        self.main_layout.addWidget(self.token_button)
 
-        self.xy_pixel_size_input = QLineEdit(str(1.0)) #Can read from the metadata
+        self.form_layout = QFormLayout()
+
+        self.xy_pixel_size_input = QLineEdit(str(1.0))  # Can read from the metadata
         self.xy_pixel_size_input.setToolTip("XY pixel size in nanometers.")
         self.xy_pixel_size_input.setValidator(QDoubleValidator(0.001, 100000.0, 3))
-        self.main_layout.addWidget(self.xy_pixel_size_input)
+        self.form_layout.addRow("XY pixel size (nm):", self.xy_pixel_size_input)
 
-        self.z_pixel_size_input = QLineEdit(str(1.0)) #can read from the user input in the main UI
+        self.z_pixel_size_input = QLineEdit(str(1.0))  # Can read from the user input in the main UI
         self.z_pixel_size_input.setToolTip("Z pixel size in nanometers.")
         self.z_pixel_size_input.setValidator(QDoubleValidator(0.001, 100000.0, 3))
-        self.main_layout.addWidget(self.z_pixel_size_input)
+        self.form_layout.addRow("Z pixel size (nm):", self.z_pixel_size_input)
 
         self.dataset_name_input = QLineEdit("MyDataset")
         self.dataset_name_input.setToolTip("Name given to the dataset to upload.")
-        self.main_layout.addWidget(self.dataset_name_input)
+        self.form_layout.addRow("Dataset name:", self.dataset_name_input)
 
         self.wkn_token_input = QLineEdit()
         self.wkn_token_input.setToolTip("Webknossos API token for authentication.")
@@ -137,7 +164,9 @@ class UploadDataDialog(QDialog):
             self.wkn_token_input.setEchoMode(QLineEdit.EchoMode.Password)
         else:
             self.wkn_token_input.setEchoMode(QLineEdit.Password)
-        self.main_layout.addWidget(self.wkn_token_input)
+        self.form_layout.addRow("WebKnossos token:", self.wkn_token_input)
+
+        self.main_layout.addLayout(self.form_layout)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -164,6 +193,9 @@ class UploadDataDialog(QDialog):
     def _request_upload(self) -> None:
         self.upload_requested.emit(self.values())
         self.accept()
+
+    def _open_webknossos_token_page(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://webknossos.org/account/token"))
 
 
 class ZarrImageViewer:

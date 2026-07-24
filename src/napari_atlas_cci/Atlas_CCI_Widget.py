@@ -48,6 +48,8 @@ AXIAL_PIXEL_SIZE_UNITS = "µm" #drop down, nm and micron
 AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
 DOWNSCALE = 10
 ZALIGN_STATUS_MAX_CHARS = 120
+ZSTDCOMPRESSION_ENABLED = True
+ZSTDCOMPRESSION = 3
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
@@ -690,17 +692,21 @@ class AtlasCCIWidget(QWidget):
                 "thread_count": THREAD_COUNT,
                 "max_shift_pixels": MAX_SHIFT_PIXELS,
                 "downsampling_factor": DOWNSCALE,
+                "compression_enabled": ZSTDCOMPRESSION_ENABLED,
+                "compression_level": ZSTDCOMPRESSION,
             }
         )
         dialog.options_applied.connect(self.apply_options)
         self._exec_dialog(dialog)
 
     def apply_options(self, values: dict) -> None:
-        global THREAD_COUNT, MAX_SHIFT_PIXELS, DOWNSCALE
+        global THREAD_COUNT, MAX_SHIFT_PIXELS, DOWNSCALE, ZSTDCOMPRESSION_ENABLED, ZSTDCOMPRESSION
 
         THREAD_COUNT = int(values["thread_count"])
         MAX_SHIFT_PIXELS = int(values["max_shift_pixels"])
         DOWNSCALE = int(values["downsampling_factor"])
+        ZSTDCOMPRESSION_ENABLED = bool(values["compression_enabled"])
+        ZSTDCOMPRESSION = int(values["compression_level"])
         show_info("Atlas CCI options updated.")
 
     def _exec_dialog(self, dialog) -> int:
@@ -1506,7 +1512,14 @@ class AtlasCCIWidget(QWidget):
             pix_xy = float(self.pixel_size.get("Value", 1.0))
             pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
 
-            with pyczi.create_czi(czi_path, exist_ok=True) as czidoc_w:
+            compression_options = (
+                f"zstd0:ExplicitLevel={ZSTDCOMPRESSION}"
+                if ZSTDCOMPRESSION_ENABLED
+                else None
+            )
+            with pyczi.create_czi(
+                czi_path, exist_ok=True, compression_options=compression_options
+            ) as czidoc_w:
                 for frame in range(zarr_array.shape[0]):
                     tmp_plane = np.asarray(zarr_array[frame, :, :]).squeeze()
                     czidoc_w.write(data=tmp_plane[..., np.newaxis], plane={"Z": frame})
