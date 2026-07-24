@@ -79,6 +79,14 @@ class AtlasCCIWidget(QWidget):
         self._zalign_timer = QTimer(self)
         self._zalign_timer.setInterval(120)
         self._zalign_timer.timeout.connect(self._poll_zalign_future)
+
+        self._export_executor = ThreadPoolExecutor(max_workers=1)
+        self._export_future: Future | None = None
+        self._export_active_action: str | None = None
+        self._export_spinner_index = 0
+        self._export_timer = QTimer(self)
+        self._export_timer.setInterval(120)
+        self._export_timer.timeout.connect(self._poll_export_future)
         self.setWindowTitle("Atlas CCI")
 
         self.main_layout = QVBoxLayout(self)
@@ -475,7 +483,7 @@ class AtlasCCIWidget(QWidget):
             ),
         )
 
-        if not self._is_zalign_running():
+        if not self._is_zalign_running() and not self._is_export_running():
             self.zalign_zshift_button.setEnabled(all_processed)
             self.zalign_preview_button.setEnabled(has_preview_zarr)
             self.correction_Z_btn.setEnabled(has_zcalc)
@@ -627,6 +635,9 @@ class AtlasCCIWidget(QWidget):
     def _is_zalign_running(self) -> bool:
         return self._zalign_future is not None and not self._zalign_future.done()
 
+    def _is_export_running(self) -> bool:
+        return self._export_future is not None and not self._export_future.done()
+
     def _set_zalign_status(self, state: str, details: str, color: QColor) -> None:
         full_text = f"Z Align: [{state}] {details}"
         compact_details = textwrap.shorten(
@@ -684,6 +695,67 @@ class AtlasCCIWidget(QWidget):
         self.zalign_final_button.setText("Final Z Alignment")
         self.zalign_view_button.setText("View")
         self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
+
+    def _set_export_buttons_busy(self) -> None:
+        self.zalign_zshift_button.setEnabled(False)
+        self.zalign_preview_button.setEnabled(False)
+        self.correction_Z_btn.setEnabled(False)
+        self.correction_apply_btn.setEnabled(False)
+        self.zalign_final_button.setEnabled(False)
+        self.zalign_view_button.setEnabled(False)
+        self.export_czi_button.setEnabled(False)
+        self.upload_wkn_button.setEnabled(False)
+        self._export_spinner_index = 0
+        self._update_export_busy_text()
+        self._export_timer.start()
+
+    def _update_export_busy_text(self) -> None:
+        frame = self._zalign_spinner_frames[self._export_spinner_index]
+        self._export_spinner_index = (self._export_spinner_index + 1) % len(self._zalign_spinner_frames)
+
+        if self._export_active_action == "czi":
+            self.export_czi_button.setText(f"Export to CZI {frame}")
+            self.upload_wkn_button.setText("Upload to Webknossos...")
+        elif self._export_active_action == "webknossos":
+            self.export_czi_button.setText("Export to CZI")
+            self.upload_wkn_button.setText(f"Upload to Webknossos {frame}")
+
+    def _reset_export_buttons_idle(self) -> None:
+        self._export_timer.stop()
+        self.export_czi_button.setText("Export to CZI")
+        self.upload_wkn_button.setText("Upload to Webknossos...")
+        self._update_project_leaf_and_zalign_controls(Path(self.main_directory))
+
+    def _poll_export_future(self) -> None:
+        future = self._export_future
+        if future is None:
+            self._reset_export_buttons_idle()
+            return
+
+        if not future.done():
+            self._update_export_busy_text()
+            return
+
+        action = self._export_active_action
+        self._export_future = None
+        self._export_active_action = None
+        self._reset_export_buttons_idle()
+
+        try:
+            success, message, payload = future.result()
+        except Exception as exc:
+            show_error(f"Export task failed: {exc}")
+            return
+
+        if not success:
+            show_error(message)
+            return
+
+        if action == "czi":
+            show_info(f"Exported CZI: {payload}")
+        elif action == "webknossos":
+            show_info(f"Successfully uploaded {payload}")
+            self.update_series_status_indicators(Path(self.main_directory))
 
     def open_options_dialog(self) -> None:
         dialog = OptionsDialog(self)
@@ -1490,17 +1562,49 @@ class AtlasCCIWidget(QWidget):
             return axial_value * 1000.0
         return axial_value
 
-    def export_to_czi(self) -> Path | None:
-        from pylibCZIrw import czi as pyczi
-        import zarr
+    def export_to_czi(self) -> None:
+        if self._is_export_running():
+            show_error("An export or upload task is already running.")
+            return
 
         zarr_path = self._final_zarr_path()
         if not zarr_path.exists():
             show_error("Final Z alignment Zarr output not found.")
-            return None
+            return
 
         if not self.update_pixel_size_from_input():
-            return None
+            return
+
+        czi_path = self._aligned_czi_path()
+        pix_xy = float(self.pixel_size.get("Value", 1.0))
+        pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
+        compression_options = (
+            f"zstd0:ExplicitLevel={ZSTDCOMPRESSION}"
+            if ZSTDCOMPRESSION_ENABLED
+            else None
+        )
+
+        self._export_active_action = "czi"
+        self._export_future = self._export_executor.submit(
+            self._export_to_czi_worker,
+            zarr_path,
+            czi_path,
+            pix_xy,
+            pix_z,
+            compression_options,
+        )
+        self._set_export_buttons_busy()
+
+    def _export_to_czi_worker(
+        self,
+        zarr_path: Path,
+        czi_path: Path,
+        pix_xy: float,
+        pix_z: float,
+        compression_options: str | None,
+    ) -> tuple[bool, str, Path | None]:
+        from pylibCZIrw import czi as pyczi
+        import zarr
 
         try:
             dataset_path = self._ome_zarr_dataset_path(zarr_path)
@@ -1508,15 +1612,6 @@ class AtlasCCIWidget(QWidget):
             if len(zarr_array.shape) != 3:
                 raise ValueError(f"Expected a 3D OME-Zarr dataset, got shape {zarr_array.shape}")
 
-            czi_path = self._aligned_czi_path()
-            pix_xy = float(self.pixel_size.get("Value", 1.0))
-            pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
-
-            compression_options = (
-                f"zstd0:ExplicitLevel={ZSTDCOMPRESSION}"
-                if ZSTDCOMPRESSION_ENABLED
-                else None
-            )
             with pyczi.create_czi(
                 czi_path, exist_ok=True, compression_options=compression_options
             ) as czidoc_w:
@@ -1532,13 +1627,15 @@ class AtlasCCIWidget(QWidget):
                     scale_z=pix_z * 10 ** -6,
                 )
         except Exception as exc:
-            show_error(f"Failed to export CZI: {exc}")
-            return None
+            return False, f"Failed to export CZI: {exc}", None
 
-        show_info(f"Exported CZI: {czi_path}")
-        return czi_path
+        return True, "CZI export complete.", czi_path
 
     def upload_to_webknossos(self) -> None:
+        if self._is_export_running():
+            show_error("An export or upload task is already running.")
+            return
+
         final_zarr_path = self._final_zarr_path()
         if not final_zarr_path.exists():
             show_error("Final Z alignment Zarr output not found.")
@@ -1560,15 +1657,9 @@ class AtlasCCIWidget(QWidget):
         self._exec_dialog(dialog)
 
     def _upload_to_webknossos(self, values: dict) -> None:
-        import dask.array as da
-        import tempfile
-        from upath import UPath
-        from webknossos import Dataset, webknossos_context
-        from webknossos.cli.convert_zarr import convert_zarr
-        from webknossos.dataset.defaults import DEFAULT_CHUNK_SHAPE, DEFAULT_SHARD_SHAPE
-        from webknossos.dataset.sampling_modes import SamplingModes
-        from webknossos.dataset_properties import DataFormat, VoxelSize
-        from webknossos.geometry.mag import Mag
+        if self._is_export_running():
+            show_error("An export or upload task is already running.")
+            return
 
         token = str(values.get("wkn_token", "")).strip()
         dataset_name = str(values.get("dataset_name", "")).strip()
@@ -1589,6 +1680,33 @@ class AtlasCCIWidget(QWidget):
             1.0,
             float(values.get("z_pixel_size", self._axial_pixel_size_nm())),
         )
+
+        self._export_active_action = "webknossos"
+        self._export_future = self._export_executor.submit(
+            self._upload_to_webknossos_worker,
+            final_zarr_path,
+            token,
+            dataset_name,
+            voxel_size,
+        )
+        self._set_export_buttons_busy()
+
+    def _upload_to_webknossos_worker(
+        self,
+        final_zarr_path: Path,
+        token: str,
+        dataset_name: str,
+        voxel_size: tuple[float, float, float],
+    ) -> tuple[bool, str, str | None]:
+        import dask.array as da
+        import tempfile
+        from upath import UPath
+        from webknossos import Dataset, webknossos_context
+        from webknossos.cli.convert_zarr import convert_zarr
+        from webknossos.dataset.defaults import DEFAULT_CHUNK_SHAPE, DEFAULT_SHARD_SHAPE
+        from webknossos.dataset.sampling_modes import SamplingModes
+        from webknossos.dataset_properties import DataFormat, VoxelSize
+        from webknossos.geometry.mag import Mag
 
         try:
             with tempfile.TemporaryDirectory(prefix="atlas_cci_wk_") as temp_dir:
@@ -1629,10 +1747,7 @@ class AtlasCCIWidget(QWidget):
 
                     print(f"Uploading dataset to WebKnossos from {output_path}...")
                     remote_dataset = dataset.upload()
-                    show_info(f"Successfully uploaded {remote_dataset.url}")
                     print(f"Successfully uploaded {remote_dataset.url}")
+                    return True, "WebKnossos upload complete.", str(remote_dataset.url)
         except Exception as exc:
-            show_error(f"Failed to upload to WebKnossos: {exc}")
-            return
-
-        self.update_series_status_indicators(Path(self.main_directory))
+            return False, f"Failed to upload to WebKnossos: {exc}", None
