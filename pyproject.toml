@@ -31,7 +31,8 @@ dependencies = [
     "ome-zarr",
     "dask",
     "webknossos",
-    "pylibCZIrw"
+    "pylibCZIrw",
+    "atlas-cci-align==1.0.1"
 ]
 
 [project.optional-dependencies]
