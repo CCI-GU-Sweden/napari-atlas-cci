@@ -53,6 +53,8 @@ For easier data manipulation, it is possible to export the final alignement as a
 
 ![Upload to webknossos](assets/upload_to_wkn.png)
 
+![webknossos ulpoad success](<assets/webknossos upload.png>)
+
 ## Troubleshooting
 
 WIP
