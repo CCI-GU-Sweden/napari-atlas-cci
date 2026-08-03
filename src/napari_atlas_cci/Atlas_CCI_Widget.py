@@ -1543,15 +1543,32 @@ class AtlasCCIWidget(QWidget):
         import zarr
 
         root_group = zarr.open_group(str(ome_zarr_path), mode="r")
-        multiscales = root_group.attrs.get("multiscales", [])
+        attrs = dict(root_group.attrs)
+        
+        multiscales = attrs.get("multiscales", [])
+        
+        if not multiscales:
+            ome_metadata = attrs.get("ome", {})
+            if isinstance(ome_metadata, dict):
+                multiscales = ome_metadata.get("multiscales", [])
+        
         if not multiscales:
             raise ValueError("Zarr output has no multiscales metadata.")
-
+        
         datasets = multiscales[0].get("datasets", [])
+        
         if not datasets:
             raise ValueError("Zarr output has no pyramid datasets.")
-        if level >= len(datasets):
+        
+        if level < 0 or level >= len(datasets):
             raise ValueError(f"Zarr output has no pyramid level {level}.")
+
+        dataset_path = datasets[level].get("path")
+
+        if not isinstance(dataset_path, str) or not dataset_path:
+            raise ValueError(
+                f"Pyramid level {level} has no valid dataset path."
+            )
 
         return ome_zarr_path.joinpath(str(datasets[level]["path"]))
 
