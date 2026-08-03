@@ -31,7 +31,7 @@ dependencies = [
     "dask",
     "webknossos",
     "pylibCZIrw",
-    "atlas-cci-align==1.2.1"
+    "atlas-cci-align==1.2.2"
 ]
 
 [project.optional-dependencies]
