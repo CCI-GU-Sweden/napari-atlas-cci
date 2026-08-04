@@ -1168,7 +1168,14 @@ class AtlasCCIWidget(QWidget):
 
         print(f"Wrote OME-Zarr pyramid: {temp_ome_zarr_path}")
 
-        multiscales = root_group.attrs.get("multiscales", [])
+        attrs = dict(root_group.attrs)
+        multiscales = attrs.get("multiscales", [])
+                
+        if not multiscales:
+            ome_metadata = attrs.get("ome", {})
+            if isinstance(ome_metadata, dict):
+                multiscales = ome_metadata.get("multiscales", [])
+        
         if not multiscales:
             return False, "OME-Zarr file was written, but no multiscales metadata was found.", None
 
@@ -1553,12 +1560,11 @@ class AtlasCCIWidget(QWidget):
                 multiscales = ome_metadata.get("multiscales", [])
         
         if not multiscales:
-            raise ValueError("Zarr output has no multiscales metadata.")
-        
+            return False, "OME-Zarr file was written, but no multiscales metadata was found.", None
+
         datasets = multiscales[0].get("datasets", [])
-        
         if not datasets:
-            raise ValueError("Zarr output has no pyramid datasets.")
+            return False, "OME-Zarr file was written, but no pyramid datasets were found.", None
         
         if level < 0 or level >= len(datasets):
             raise ValueError(f"Zarr output has no pyramid level {level}.")

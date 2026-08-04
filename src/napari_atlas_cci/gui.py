@@ -223,7 +223,15 @@ class ZarrImageViewer:
 
         try:
             root_group = zarr.open_group(str(ome_zarr_path), mode="r")
-            multiscales = root_group.attrs.get("multiscales", [])
+            attrs = dict(root_group.attrs)
+                    
+            multiscales = attrs.get("multiscales", [])
+            
+            if not multiscales:
+                ome_metadata = attrs.get("ome", {})
+                if isinstance(ome_metadata, dict):
+                    multiscales = ome_metadata.get("multiscales", [])
+            
             if not multiscales:
                 return False, "Zarr output has no multiscales metadata."
 
