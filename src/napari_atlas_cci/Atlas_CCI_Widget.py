@@ -1686,6 +1686,9 @@ class AtlasCCIWidget(QWidget):
         safe_name = re.sub(r'[<>:"/\\|?*]+', "_", name).strip(" ._")
         return safe_name or "webknossos_dataset"
 
+    def _webknossos_upload_name(self, dataset_name: str) -> str:
+        return self._safe_output_name(dataset_name)
+
     def _webknossos_output_root(self, root_folder: Path) -> Path:
         return root_folder.joinpath("webknossos")
 
@@ -1894,6 +1897,7 @@ class AtlasCCIWidget(QWidget):
 
         try:
             total_start = time.perf_counter()
+            upload_dataset_name = self._webknossos_upload_name(dataset_name)
             project_output_root = self._webknossos_output_root(root_folder)
             project_source_path = self._webknossos_source_zarr_path(root_folder, dataset_name)
             project_dataset_path = self._webknossos_dataset_path(root_folder, dataset_name)
@@ -1991,6 +1995,7 @@ class AtlasCCIWidget(QWidget):
 
                 downsample_start = time.perf_counter()
                 dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
+                dataset.name = upload_dataset_name
                 dataset.downsample(
                     sampling_mode=SamplingModes.ANISOTROPIC,
                     coarsest_mag=Mag(32),
@@ -2017,9 +2022,13 @@ class AtlasCCIWidget(QWidget):
 
             with webknossos_context(token=token):
                 dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
-                print(f"Uploading dataset to WebKnossos from local cache {local_dataset_path}...")
+                dataset.name = upload_dataset_name
+                print(
+                    "Uploading dataset to WebKnossos "
+                    f"as {upload_dataset_name} from local cache {local_dataset_path}..."
+                )
                 upload_start = time.perf_counter()
-                remote_dataset = dataset.upload()
+                remote_dataset = dataset.upload(new_dataset_name=upload_dataset_name)
                 print(f"WebKnossos upload took {time.perf_counter() - upload_start:.2f}s")
                 print(f"WebKnossos total build/upload time: {time.perf_counter() - total_start:.2f}s")
                 print(f"Successfully uploaded {remote_dataset.url}")
