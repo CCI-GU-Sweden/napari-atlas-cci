@@ -50,6 +50,7 @@ DOWNSCALE = 10
 ZALIGN_STATUS_MAX_CHARS = 120
 ZSTDCOMPRESSION_ENABLED = True
 ZSTDCOMPRESSION = 3
+CZI_MEMORY_EXPORT_LIMIT_BYTES = 8 * 1024 ** 3
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
@@ -163,7 +164,7 @@ class AtlasCCIWidget(QWidget):
         self.initial_zalign_layout.addWidget(self.zalign_zshift_button)
 
         self.zalign_preview_button = QPushButton("Preview")
-        self.zalign_preview_button.setToolTip("Display the downsampled Z alignment Zarr output.")
+        self.zalign_preview_button.setToolTip("Display the downsampled Z alignment OME-Zarr output.")
         self.zalign_preview_button.clicked.connect(self.display_initial_zalign_preview)
         self.zalign_preview_button.setEnabled(False)
         self.initial_zalign_layout.addWidget(self.zalign_preview_button)
@@ -179,7 +180,7 @@ class AtlasCCIWidget(QWidget):
         self.correction_Z_btn.setEnabled(False)
 
         self.correction_apply_btn = QPushButton("Apply Correction")
-        self.correction_apply_btn.setToolTip("Apply manual Z correction to the downsampled preview Zarr output.")
+        self.correction_apply_btn.setToolTip("Apply manual Z correction to the downsampled preview OME-Zarr output.")
         self.correction_apply_btn.clicked.connect(self.apply_correction)
         self.correction_apply_btn.setEnabled(False)
 
@@ -192,13 +193,13 @@ class AtlasCCIWidget(QWidget):
         self.final_zalign_layout = QHBoxLayout()
 
         self.zalign_final_button = QPushButton("Final Z Alignment")
-        self.zalign_final_button.setToolTip("Apply previously calculated Z shifts to the stitched series and save as Zarr output.")
+        self.zalign_final_button.setToolTip("Apply previously calculated Z shifts to the stitched series and save as aligned Zarr output.")
         self.zalign_final_button.clicked.connect(self.finalize_alignement)
         self.zalign_final_button.setEnabled(False)
         self.final_zalign_layout.addWidget(self.zalign_final_button)
 
         self.zalign_view_button = QPushButton("View")
-        self.zalign_view_button.setToolTip("Display the final Z alignment Zarr output.")
+        self.zalign_view_button.setToolTip("Display the final Z alignment OME-Zarr output.")
         self.zalign_view_button.clicked.connect(self.display_final_zalign_output)
         self.zalign_view_button.setEnabled(False)
         self.final_zalign_layout.addWidget(self.zalign_view_button)
@@ -222,13 +223,13 @@ class AtlasCCIWidget(QWidget):
         self.export_layout = QHBoxLayout()
 
         self.export_czi_button = QPushButton("Export to CZI")
-        self.export_czi_button.setToolTip("Export the final Z alignment Zarr output to CZI format.")
+        self.export_czi_button.setToolTip("Export the final aligned Zarr output to CZI format.")
         self.export_czi_button.clicked.connect(self.export_to_czi)
         self.export_czi_button.setEnabled(False)
         self.export_layout.addWidget(self.export_czi_button)
 
         self.upload_wkn_button = QPushButton("Upload to Webknossos...")
-        self.upload_wkn_button.setToolTip("Upload the final Z alignment Zarr output to Webknossos.")
+        self.upload_wkn_button.setToolTip("Upload the final aligned Zarr output to Webknossos.")
         self.upload_wkn_button.clicked.connect(self.upload_to_webknossos)
         self.upload_wkn_button.setEnabled(False)
         self.export_layout.addWidget(self.upload_wkn_button)
@@ -410,16 +411,26 @@ class AtlasCCIWidget(QWidget):
     def _has_z_alignment_results(self, root_folder: Path) -> bool:
         return root_folder.joinpath("alignment_results", "z_alignment_results.pkl").exists()
 
-    def _zarr_output_path(self, root_folder: Path, use_downsample: bool) -> Path:
-        expected_base = root_folder.name
-        suffix = "_downsample" if use_downsample else ""
-        return root_folder.joinpath(f"{expected_base}{suffix}.zarr")
+    def _aligned_zarr_path(self, root_folder: Path) -> Path:
+        return root_folder.joinpath(f"{root_folder.name}_aligned.zarr")
 
-    def _has_preview_zarr_output(self, root_folder: Path) -> bool:
-        return self._zarr_output_path(root_folder, use_downsample=True).exists()
+    def _aligned_ome_zarr_path(self, root_folder: Path) -> Path:
+        return root_folder.joinpath(f"{root_folder.name}_aligned.ome.zarr")
+
+    def _preview_ome_zarr_path(self, root_folder: Path) -> Path:
+        return root_folder.joinpath(f"{root_folder.name}_downsample.ome.zarr")
+
+    def _legacy_alignment_zarr_path(self, root_folder: Path) -> Path:
+        return root_folder.joinpath(f"{root_folder.name}.zarr")
+
+    def _has_preview_ome_zarr_output(self, root_folder: Path) -> bool:
+        return self._preview_ome_zarr_path(root_folder).exists()
 
     def _has_aligned_zarr_output(self, root_folder: Path) -> bool:
-        return self._zarr_output_path(root_folder, use_downsample=False).exists()
+        return self._aligned_zarr_path(root_folder).exists()
+
+    def _has_aligned_ome_zarr_output(self, root_folder: Path) -> bool:
+        return self._aligned_ome_zarr_path(root_folder).exists()
 
     def _all_series_processed(self, root_folder: Path) -> bool:
         root_item = self.local_folder_tree.topLevelItem(0)
@@ -449,13 +460,14 @@ class AtlasCCIWidget(QWidget):
 
         all_processed = self._all_series_processed(root_folder)
         has_zcalc = self._has_z_alignment_results(root_folder)
-        has_preview_zarr = self._has_preview_zarr_output(root_folder)
+        has_preview_ome_zarr = self._has_preview_ome_zarr_output(root_folder)
         has_zarr = self._has_aligned_zarr_output(root_folder)
+        has_aligned_ome_zarr = self._has_aligned_ome_zarr_output(root_folder)
 
         if has_zarr:
             project_state_label = "[Completed]"
             project_state_color = PROCESSED
-            project_state_details = "Zarr output present"
+            project_state_details = "Aligned Zarr output present"
         elif has_zcalc:
             project_state_label = "[Z-Calculation READY]"
             project_state_color = ONGOING
@@ -478,24 +490,25 @@ class AtlasCCIWidget(QWidget):
                 f"State: {project_state_label} {project_state_details}\n"
                 f"all stitched: {'yes' if all_processed else 'no'}\n"
                 f"z_alignment_results.pkl: {'yes' if has_zcalc else 'no'}\n"
-                f"preview zarr output: {'yes' if has_preview_zarr else 'no'}\n"
-                f"zarr output: {'yes' if has_zarr else 'no'}"
+                f"preview OME-Zarr output: {'yes' if has_preview_ome_zarr else 'no'}\n"
+                f"aligned Zarr output: {'yes' if has_zarr else 'no'}\n"
+                f"aligned OME-Zarr output: {'yes' if has_aligned_ome_zarr else 'no'}"
             ),
         )
 
         if not self._is_zalign_running() and not self._is_export_running():
             self.zalign_zshift_button.setEnabled(all_processed)
-            self.zalign_preview_button.setEnabled(has_preview_zarr)
+            self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
             self.correction_Z_btn.setEnabled(has_zcalc)
             self.correction_apply_btn.setEnabled(has_zcalc)
             self.zalign_final_button.setEnabled(has_zcalc)
-            self.zalign_view_button.setEnabled(has_zarr)
+            self.zalign_view_button.setEnabled(has_aligned_ome_zarr)
             self.export_czi_button.setEnabled(has_zarr)
             self.upload_wkn_button.setEnabled(has_zarr)
             self._update_zalign_status_from_outputs(
                 all_processed=all_processed,
                 has_zcalc=has_zcalc,
-                has_preview_zarr=has_preview_zarr,
+                has_preview_ome_zarr=has_preview_ome_zarr,
                 has_zarr=has_zarr,
             )
 
@@ -653,13 +666,13 @@ class AtlasCCIWidget(QWidget):
         self,
         all_processed: bool,
         has_zcalc: bool,
-        has_preview_zarr: bool,
+        has_preview_ome_zarr: bool,
         has_zarr: bool,
     ) -> None:
         if has_zarr:
-            self._set_zalign_status("PROCESSED", "Final Z alignment complete", PROCESSED)
-        elif has_preview_zarr:
-            self._set_zalign_status("PROCESSED", "Preview Z alignment complete; final alignment ready", PROCESSED)
+            self._set_zalign_status("PROCESSED", "Final aligned Zarr complete", PROCESSED)
+        elif has_preview_ome_zarr:
+            self._set_zalign_status("PROCESSED", "Preview OME-Zarr complete; final alignment ready", PROCESSED)
         elif has_zcalc:
             self._set_zalign_status("PENDING", "Initial Z alignment complete; final alignment ready", PENDING)
         elif all_processed:
@@ -1073,66 +1086,53 @@ class AtlasCCIWidget(QWidget):
             },
         )
 
-    def _apply_z_shifts_worker(
+    def _normalize_aligned_array_axes(self, data):
+        if data.ndim not in (2, 3):
+            raise ValueError(f"Expected 2D or 3D aligned data, got shape {data.shape}.")
+
+        # Normalize 3D data to ZYX for writing/viewing.
+        if data.ndim == 3:
+            z_axis = int(np.argmin(data.shape))
+            if z_axis != 0:
+                if not isinstance(data, np.ndarray):
+                    import dask.array as da
+                    return da.moveaxis(
+                        da.from_array(data, chunks=getattr(data, "chunks", "auto")),
+                        z_axis,
+                        0,
+                    )
+                return np.moveaxis(data, z_axis, 0)
+
+        return data
+
+    def _replace_directory_from_temp(self, temp_path: Path, final_path: Path) -> None:
+        import gc
+        import shutil
+
+        if final_path.exists():
+            shutil.rmtree(final_path)
+
+        gc.collect()
+        try:
+            temp_path.rename(final_path)
+        except PermissionError:
+            # Some Windows network drives reject directory renames immediately
+            # after Zarr writes. Copying is slower but avoids that failure mode.
+            shutil.copytree(temp_path, final_path)
+            shutil.rmtree(temp_path)
+
+    def _write_ome_zarr_pyramid_from_array(
         self,
-        root_folder: Path,
-        use_downsample: bool,
+        data,
+        ome_zarr_path: Path,
+        layer_name: str,
     ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
-        from atlas.io import apply_alignment
         from ome_zarr.io import parse_url
         from ome_zarr.scale import Scaler
         from ome_zarr.writer import write_image
         import shutil
         import zarr
 
-        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
-        if not z_align_df_path.exists():
-            return False, "Z alignment results not found. Please run the alignment first.", None
-
-        z_align_df = pd.read_pickle(z_align_df_path)
-
-        print(z_align_df.head(5))
-
-        internal_zarr_path = self._zarr_output_path(root_folder, use_downsample=False)
-        preserved_final_zarr_path = internal_zarr_path.with_name(
-            f"{internal_zarr_path.name}.preserved"
-        )
-        if use_downsample:
-            if not internal_zarr_path.exists() and preserved_final_zarr_path.exists():
-                preserved_final_zarr_path.rename(internal_zarr_path)
-            if internal_zarr_path.exists():
-                if preserved_final_zarr_path.exists():
-                    shutil.rmtree(preserved_final_zarr_path)
-                internal_zarr_path.rename(preserved_final_zarr_path)
-
-        zarr_array = None
-        try:
-            zarr_array, _ = apply_alignment(
-                z_align_df,
-                buffer_pixels=20,
-                percentile_low=2.0,
-                percentile_high=99.95,
-                use_down_sample=use_downsample,
-            )
-            data = np.asarray(zarr_array)
-        finally:
-            zarr_array = None
-            if use_downsample:
-                if internal_zarr_path.exists():
-                    shutil.rmtree(internal_zarr_path)
-                if preserved_final_zarr_path.exists():
-                    preserved_final_zarr_path.rename(internal_zarr_path)
-
-        if data.ndim not in (2, 3):
-            return False, f"Expected 2D or 3D aligned data, got shape {data.shape}.", None
-
-        # Normalize 3D data to ZYX for writing/viewing.
-        if data.ndim == 3:
-            z_axis = int(np.argmin(data.shape))
-            if z_axis != 0:
-                data = np.moveaxis(data, z_axis, 0)
-
-        ome_zarr_path = self._zarr_output_path(root_folder, use_downsample=use_downsample)
         temp_ome_zarr_path = ome_zarr_path.with_name(f"{ome_zarr_path.name}.tmp")
         if temp_ome_zarr_path.exists():
             shutil.rmtree(temp_ome_zarr_path)
@@ -1183,19 +1183,16 @@ class AtlasCCIWidget(QWidget):
         if not datasets:
             return False, "OME-Zarr file was written, but no pyramid datasets were found.", None
 
-        if ome_zarr_path.exists():
-            shutil.rmtree(ome_zarr_path)
-        temp_ome_zarr_path.rename(ome_zarr_path)
+        self._replace_directory_from_temp(temp_ome_zarr_path, ome_zarr_path)
 
-        if np.issubdtype(data.dtype, np.integer):
-            p_low, p_high = np.percentile(data, [1.0, 99.8])
+        stats_data = np.asarray(data)
+        if np.issubdtype(stats_data.dtype, np.integer):
+            p_low, p_high = np.percentile(stats_data, [1.0, 99.8])
         else:
-            p_low, p_high = np.percentile(data, [0.5, 99.5])
+            p_low, p_high = np.percentile(stats_data, [0.5, 99.5])
         if float(p_low) == float(p_high):
-            p_low = float(data.min())
-            p_high = float(data.max())
-
-        layer_name = root_folder.name + ("_downsample" if use_downsample else "")
+            p_low = float(stats_data.min())
+            p_high = float(stats_data.max())
 
         return (
             True,
@@ -1208,6 +1205,100 @@ class AtlasCCIWidget(QWidget):
                 "p_high": float(p_high),
             },
         )
+
+    def _apply_z_shifts_preview_worker(
+        self,
+        root_folder: Path,
+    ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
+        from atlas.io import apply_alignment
+        import shutil
+
+        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        if not z_align_df_path.exists():
+            return False, "Z alignment results not found. Please run the alignment first.", None
+
+        z_align_df = pd.read_pickle(z_align_df_path)
+        print(z_align_df.head(5))
+
+        zarr_array, _ = apply_alignment(
+            z_align_df,
+            buffer_pixels=20,
+            percentile_low=2.0,
+            percentile_high=99.95,
+            use_down_sample=True,
+        )
+
+        try:
+            data = self._normalize_aligned_array_axes(np.asarray(zarr_array))
+        except ValueError as exc:
+            return False, str(exc), None
+
+        success, message, payload = self._write_ome_zarr_pyramid_from_array(
+            data,
+            self._preview_ome_zarr_path(root_folder),
+            root_folder.name + "_downsample",
+        )
+        legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
+        if legacy_zarr_path.exists():
+            shutil.rmtree(legacy_zarr_path)
+
+        return success, message, payload
+
+    def _write_aligned_zarr_worker(
+        self,
+        root_folder: Path,
+    ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
+        from atlas.io import apply_alignment
+        import dask.array as da
+        import shutil
+
+        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        if not z_align_df_path.exists():
+            return False, "Z alignment results not found. Please run the alignment first.", None
+
+        z_align_df = pd.read_pickle(z_align_df_path)
+        print(z_align_df.head(5))
+
+        zarr_array, _ = apply_alignment(
+            z_align_df,
+            buffer_pixels=20,
+            percentile_low=2.0,
+            percentile_high=99.95,
+            use_down_sample=False,
+        )
+
+        try:
+            aligned_array = self._normalize_aligned_array_axes(zarr_array)
+        except ValueError as exc:
+            return False, str(exc), None
+
+        aligned_zarr_path = self._aligned_zarr_path(root_folder)
+        temp_aligned_zarr_path = aligned_zarr_path.with_name(f"{aligned_zarr_path.name}.tmp")
+        if temp_aligned_zarr_path.exists():
+            shutil.rmtree(temp_aligned_zarr_path)
+
+        if isinstance(aligned_array, da.Array):
+            dask_array = aligned_array
+        else:
+            chunks = getattr(aligned_array, "chunks", None)
+            dask_array = da.from_array(aligned_array, chunks=chunks or "auto")
+        da.to_zarr(dask_array, str(temp_aligned_zarr_path), overwrite=True)
+
+        self._replace_directory_from_temp(temp_aligned_zarr_path, aligned_zarr_path)
+
+        ome_success, ome_message, ome_payload = self._write_ome_zarr_pyramid_from_array(
+            np.asarray(da.from_zarr(str(aligned_zarr_path))),
+            self._aligned_ome_zarr_path(root_folder),
+            root_folder.name,
+        )
+        if not ome_success or ome_payload is None:
+            return False, ome_message, None
+
+        legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
+        if legacy_zarr_path.exists():
+            shutil.rmtree(legacy_zarr_path)
+
+        return True, "", {"aligned_zarr_path": str(aligned_zarr_path), **ome_payload}
 
     def _initial_alignement_worker(
         self,
@@ -1223,10 +1314,7 @@ class AtlasCCIWidget(QWidget):
         if not prepare_success or prepare_payload is None:
             return False, prepare_message, None
 
-        apply_success, apply_message, apply_payload = self._apply_z_shifts_worker(
-            root_folder,
-            use_downsample=True,
-        )
+        apply_success, apply_message, apply_payload = self._apply_z_shifts_preview_worker(root_folder)
         if not apply_success or apply_payload is None:
             return False, apply_message, None
 
@@ -1260,10 +1348,7 @@ class AtlasCCIWidget(QWidget):
 
         corrected_z_align_df.to_pickle(z_align_df_path)
 
-        apply_success, apply_message, apply_payload = self._apply_z_shifts_worker(
-            root_folder,
-            use_downsample=True,
-        )
+        apply_success, apply_message, apply_payload = self._apply_z_shifts_preview_worker(root_folder)
         if not apply_success or apply_payload is None:
             return False, apply_message, None
 
@@ -1345,23 +1430,26 @@ class AtlasCCIWidget(QWidget):
 
         self._zalign_active_action = "final"
         self._zalign_future = self._zalign_executor.submit(
-            self._apply_z_shifts_worker,
+            self._write_aligned_zarr_worker,
             root_folder,
-            False,
         )
         self._set_zalign_buttons_busy()
 
-    def _display_zalign_zarr(self, use_downsample: bool) -> None:
+    def _display_zalign_ome_zarr(self, use_downsample: bool) -> None:
         root_folder = Path(self.main_directory)
-        zarr_path = self._zarr_output_path(root_folder, use_downsample=use_downsample)
-        if not zarr_path.exists():
+        ome_zarr_path = (
+            self._preview_ome_zarr_path(root_folder)
+            if use_downsample
+            else self._aligned_ome_zarr_path(root_folder)
+        )
+        if not ome_zarr_path.exists():
             output_type = "preview" if use_downsample else "final"
-            show_error(f"No {output_type} Z alignment Zarr output found.")
+            show_error(f"No {output_type} Z alignment OME-Zarr output found.")
             self.update_series_status_indicators(root_folder)
             return
 
         success, message = self.zarr_viewer.display_ome_zarr(
-            zarr_path,
+            ome_zarr_path,
             layer_name=root_folder.name + ("_downsample" if use_downsample else ""),
         )
         if not success:
@@ -1376,10 +1464,10 @@ class AtlasCCIWidget(QWidget):
             self._set_zalign_status("PROCESSED", "Final Z alignment displayed", PROCESSED)
 
     def display_initial_zalign_preview(self) -> None:
-        self._display_zalign_zarr(use_downsample=True)
+        self._display_zalign_ome_zarr(use_downsample=True)
 
     def display_final_zalign_output(self) -> None:
-        self._display_zalign_zarr(use_downsample=False)
+        self._display_zalign_ome_zarr(use_downsample=False)
 
     def _remove_zalign_image_layer(self, use_downsample: bool) -> None:
         import gc
@@ -1540,43 +1628,40 @@ class AtlasCCIWidget(QWidget):
         self.viewer.layers.remove(moving_layer)
 
     def _final_zarr_path(self) -> Path:
-        return self._zarr_output_path(Path(self.main_directory), use_downsample=False)
+        return self._aligned_zarr_path(Path(self.main_directory))
 
     def _aligned_czi_path(self) -> Path:
         root_folder = Path(self.main_directory)
         return root_folder.joinpath(f"{root_folder.name}_aligned.czi")
 
-    def _ome_zarr_dataset_path(self, ome_zarr_path: Path, level: int = 0) -> Path:
-        import zarr
+    def _safe_output_name(self, name: str) -> str:
+        safe_name = re.sub(r'[<>:"/\\|?*]+', "_", name).strip(" ._")
+        return safe_name or "webknossos_dataset"
 
-        root_group = zarr.open_group(str(ome_zarr_path), mode="r")
-        attrs = dict(root_group.attrs)
-        
-        multiscales = attrs.get("multiscales", [])
-        
-        if not multiscales:
-            ome_metadata = attrs.get("ome", {})
-            if isinstance(ome_metadata, dict):
-                multiscales = ome_metadata.get("multiscales", [])
-        
-        if not multiscales:
-            return False, "OME-Zarr file was written, but no multiscales metadata was found.", None
+    def _webknossos_output_root(self, root_folder: Path) -> Path:
+        return root_folder.joinpath("webknossos")
 
-        datasets = multiscales[0].get("datasets", [])
-        if not datasets:
-            return False, "OME-Zarr file was written, but no pyramid datasets were found.", None
-        
-        if level < 0 or level >= len(datasets):
-            raise ValueError(f"Zarr output has no pyramid level {level}.")
+    def _webknossos_source_zarr_path(self, root_folder: Path, dataset_name: str) -> Path:
+        safe_name = self._safe_output_name(dataset_name)
+        return self._webknossos_output_root(root_folder).joinpath(f"{safe_name}_source.zarr")
 
-        dataset_path = datasets[level].get("path")
+    def _webknossos_dataset_path(self, root_folder: Path, dataset_name: str) -> Path:
+        safe_name = self._safe_output_name(dataset_name)
+        return self._webknossos_output_root(root_folder).joinpath(safe_name)
 
-        if not isinstance(dataset_path, str) or not dataset_path:
-            raise ValueError(
-                f"Pyramid level {level} has no valid dataset path."
-            )
+    def _webknossos_ready_marker_path(self, dataset_path: Path) -> Path:
+        return dataset_path.joinpath(".atlas_cci_ready")
 
-        return ome_zarr_path.joinpath(str(datasets[level]["path"]))
+    def _webknossos_cache_root(self, root_folder: Path, dataset_name: str) -> Path:
+        import tempfile
+
+        safe_project_name = self._safe_output_name(root_folder.name)
+        safe_dataset_name = self._safe_output_name(dataset_name)
+        return Path(tempfile.gettempdir()).joinpath(
+            "atlas_cci_webknossos",
+            safe_project_name,
+            safe_dataset_name,
+        )
 
     def _axial_pixel_size_nm(self) -> float:
         axial_value = float(self.axial_pixel_size_input.text())
@@ -1592,7 +1677,7 @@ class AtlasCCIWidget(QWidget):
 
         zarr_path = self._final_zarr_path()
         if not zarr_path.exists():
-            show_error("Final Z alignment Zarr output not found.")
+            show_error("Final aligned Zarr output not found.")
             return
 
         if not self.update_pixel_size_from_input():
@@ -1627,20 +1712,45 @@ class AtlasCCIWidget(QWidget):
         compression_options: str | None,
     ) -> tuple[bool, str, Path | None]:
         from pylibCZIrw import czi as pyczi
+        import time
         import zarr
 
         try:
-            dataset_path = self._ome_zarr_dataset_path(zarr_path)
-            zarr_array = zarr.open_array(str(dataset_path), mode="r")
+            zarr_array = zarr.open_array(str(zarr_path), mode="r")
             if len(zarr_array.shape) != 3:
-                raise ValueError(f"Expected a 3D OME-Zarr dataset, got shape {zarr_array.shape}")
+                raise ValueError(f"Expected a 3D aligned Zarr dataset, got shape {zarr_array.shape}")
+
+            dataset_bytes = int(np.prod(zarr_array.shape) * np.dtype(zarr_array.dtype).itemsize)
+            use_memory_export = dataset_bytes <= CZI_MEMORY_EXPORT_LIMIT_BYTES
+            print(
+                "CZI export source: "
+                f"path={zarr_path}, shape={zarr_array.shape}, dtype={zarr_array.dtype}, "
+                f"chunks={getattr(zarr_array, 'chunks', None)}, "
+                f"size={dataset_bytes / 1024 ** 3:.2f} GiB, "
+                f"compression={compression_options or 'none'}, "
+                f"mode={'memory' if use_memory_export else 'plane'}"
+            )
+
+            source_data = None
+            if use_memory_export:
+                load_start = time.perf_counter()
+                source_data = np.asarray(zarr_array)
+                print(f"CZI export loaded aligned Zarr into memory in {time.perf_counter() - load_start:.2f}s")
 
             with pyczi.create_czi(
                 czi_path, exist_ok=True, compression_options=compression_options
             ) as czidoc_w:
                 for frame in range(zarr_array.shape[0]):
-                    tmp_plane = np.asarray(zarr_array[frame, :, :]).squeeze()
+                    frame_start = time.perf_counter()
+                    if source_data is None:
+                        tmp_plane = np.asarray(zarr_array[frame, :, :]).squeeze()
+                    else:
+                        tmp_plane = np.asarray(source_data[frame, :, :]).squeeze()
                     czidoc_w.write(data=tmp_plane[..., np.newaxis], plane={"Z": frame})
+                    print(
+                        f"CZI export wrote Z {frame + 1}/{zarr_array.shape[0]} "
+                        f"in {time.perf_counter() - frame_start:.2f}s"
+                    )
 
                 czidoc_w.write_metadata(
                     document_name=czi_path.stem,
@@ -1661,7 +1771,7 @@ class AtlasCCIWidget(QWidget):
 
         final_zarr_path = self._final_zarr_path()
         if not final_zarr_path.exists():
-            show_error("Final Z alignment Zarr output not found.")
+            show_error("Final aligned Zarr output not found.")
             return
 
         if not self.update_pixel_size_from_input():
@@ -1695,7 +1805,7 @@ class AtlasCCIWidget(QWidget):
 
         final_zarr_path = self._final_zarr_path()
         if not final_zarr_path.exists():
-            show_error("Final Z alignment Zarr output not found.")
+            show_error("Final aligned Zarr output not found.")
             return
 
         voxel_size = (
@@ -1708,6 +1818,7 @@ class AtlasCCIWidget(QWidget):
         self._export_future = self._export_executor.submit(
             self._upload_to_webknossos_worker,
             final_zarr_path,
+            Path(self.main_directory),
             token,
             dataset_name,
             voxel_size,
@@ -1717,12 +1828,14 @@ class AtlasCCIWidget(QWidget):
     def _upload_to_webknossos_worker(
         self,
         final_zarr_path: Path,
+        root_folder: Path,
         token: str,
         dataset_name: str,
         voxel_size: tuple[float, float, float],
     ) -> tuple[bool, str, str | None]:
         import dask.array as da
-        import tempfile
+        import shutil
+        import time
         from upath import UPath
         from webknossos import Dataset, webknossos_context
         from webknossos.cli.convert_zarr import convert_zarr
@@ -1732,45 +1845,136 @@ class AtlasCCIWidget(QWidget):
         from webknossos.geometry.mag import Mag
 
         try:
-            with tempfile.TemporaryDirectory(prefix="atlas_cci_wk_") as temp_dir:
-                temp_root = Path(temp_dir)
-                upload_source_path = temp_root.joinpath(f"{dataset_name}_source.zarr")
-                output_path = temp_root.joinpath(dataset_name)
+            total_start = time.perf_counter()
+            project_output_root = self._webknossos_output_root(root_folder)
+            project_source_path = self._webknossos_source_zarr_path(root_folder, dataset_name)
+            project_dataset_path = self._webknossos_dataset_path(root_folder, dataset_name)
+            project_ready_marker_path = self._webknossos_ready_marker_path(project_dataset_path)
 
-                dataset_path = self._ome_zarr_dataset_path(final_zarr_path)
-                source_array = da.from_zarr(str(dataset_path))
+            cache_root = self._webknossos_cache_root(root_folder, dataset_name)
+            local_source_path = cache_root.joinpath("source.zarr")
+            local_dataset_path = cache_root.joinpath(self._safe_output_name(dataset_name))
+            local_ready_marker_path = self._webknossos_ready_marker_path(local_dataset_path)
+            legacy_local_dataset_path = cache_root.joinpath("dataset")
+
+            project_output_root.mkdir(parents=True, exist_ok=True)
+            cache_root.mkdir(parents=True, exist_ok=True)
+            if legacy_local_dataset_path.exists() and legacy_local_dataset_path != local_dataset_path:
+                shutil.rmtree(legacy_local_dataset_path)
+            print(
+                "WebKnossos paths: "
+                f"local_source={local_source_path}, local_dataset={local_dataset_path}, "
+                f"saved_dataset={project_dataset_path}"
+            )
+
+            final_zarr_mtime = final_zarr_path.stat().st_mtime
+            if (
+                local_ready_marker_path.exists()
+                and final_zarr_mtime > local_ready_marker_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than local WebKnossos cache; rebuilding cache.")
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+                if local_source_path.exists():
+                    shutil.rmtree(local_source_path)
+            if (
+                project_ready_marker_path.exists()
+                and final_zarr_mtime > project_ready_marker_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than saved WebKnossos dataset; rebuilding saved copy.")
+                if project_dataset_path.exists():
+                    shutil.rmtree(project_dataset_path)
+                if project_source_path.exists():
+                    shutil.rmtree(project_source_path)
+            if (
+                not local_ready_marker_path.exists()
+                and local_source_path.exists()
+                and final_zarr_mtime > local_source_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than partial WebKnossos source cache; rebuilding source cache.")
+                shutil.rmtree(local_source_path)
+
+            if not local_ready_marker_path.exists() and project_ready_marker_path.exists():
+                restore_start = time.perf_counter()
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+                print(f"Restoring local WebKnossos cache from {project_dataset_path}...")
+                shutil.copytree(project_dataset_path, local_dataset_path)
+                local_ready_marker_path.write_text("ready\n", encoding="utf-8")
+                print(f"WebKnossos cache restore took {time.perf_counter() - restore_start:.2f}s")
+
+            if not local_ready_marker_path.exists():
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+
+                print(f"Building WebKnossos dataset in local cache {local_dataset_path}...")
+                source_array = da.from_zarr(str(final_zarr_path))
                 if source_array.ndim != 3:
                     raise ValueError(f"Expected 3D Zarr data, got shape {source_array.shape}.")
 
-                # OME-Zarr is written as zyx. WebKnossos conversion expects xyz.
-                da.to_zarr(
-                    source_array.transpose(2, 1, 0),
-                    str(upload_source_path),
-                    overwrite=True,
+                if not local_source_path.exists():
+                    staging_start = time.perf_counter()
+                    # Aligned Zarr is written as zyx. WebKnossos conversion expects xyz.
+                    da.to_zarr(
+                        source_array.transpose(2, 1, 0),
+                        str(local_source_path),
+                        overwrite=True,
+                    )
+                    print(
+                        "WebKnossos data staging "
+                        f"(aligned Zarr -> local source Zarr) took {time.perf_counter() - staging_start:.2f}s"
+                    )
+                else:
+                    print(f"Reusing existing local WebKnossos source Zarr at {local_source_path}.")
+
+                convert_start = time.perf_counter()
+                convert_zarr(
+                    source_zarr_path=UPath(local_source_path),
+                    target_path=UPath(local_dataset_path),
+                    layer_name="color",
+                    data_format=DataFormat.Zarr3,
+                    chunk_shape=DEFAULT_CHUNK_SHAPE,
+                    shard_shape=DEFAULT_SHARD_SHAPE,
+                    is_segmentation_layer=False,
+                    voxel_size_with_unit=VoxelSize(voxel_size),
+                    compress=True,
                 )
+                print(f"WebKnossos conversion took {time.perf_counter() - convert_start:.2f}s")
 
-                with webknossos_context(token=token):
-                    convert_zarr(
-                        source_zarr_path=UPath(upload_source_path),
-                        target_path=UPath(output_path),
-                        layer_name="color",
-                        data_format=DataFormat.Zarr3,
-                        chunk_shape=DEFAULT_CHUNK_SHAPE,
-                        shard_shape=DEFAULT_SHARD_SHAPE,
-                        is_segmentation_layer=False,
-                        voxel_size_with_unit=VoxelSize(voxel_size),
-                        compress=True,
-                    )
+                downsample_start = time.perf_counter()
+                dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
+                dataset.downsample(
+                    sampling_mode=SamplingModes.ANISOTROPIC,
+                    coarsest_mag=Mag(32),
+                )
+                print(f"WebKnossos downsampling took {time.perf_counter() - downsample_start:.2f}s")
+                local_ready_marker_path.write_text("ready\n", encoding="utf-8")
+            else:
+                print(f"Reusing existing local WebKnossos dataset at {local_dataset_path}.")
 
-                    dataset = Dataset(output_path, voxel_size=voxel_size, exist_ok=True)
-                    dataset.downsample(
-                        sampling_mode=SamplingModes.ANISOTROPIC,
-                        coarsest_mag=Mag(32),
-                    )
+            if not project_ready_marker_path.exists():
+                save_start = time.perf_counter()
+                if project_dataset_path.exists():
+                    shutil.rmtree(project_dataset_path)
+                print(f"Saving WebKnossos dataset copy to {project_dataset_path}...")
+                shutil.copytree(local_dataset_path, project_dataset_path)
+                project_ready_marker_path.write_text("ready\n", encoding="utf-8")
+                print(f"WebKnossos dataset save took {time.perf_counter() - save_start:.2f}s")
 
-                    print(f"Uploading dataset to WebKnossos from {output_path}...")
-                    remote_dataset = dataset.upload()
-                    print(f"Successfully uploaded {remote_dataset.url}")
-                    return True, "WebKnossos upload complete.", str(remote_dataset.url)
+            if not project_source_path.exists() and local_source_path.exists():
+                source_save_start = time.perf_counter()
+                print(f"Saving WebKnossos source Zarr copy to {project_source_path}...")
+                shutil.copytree(local_source_path, project_source_path)
+                print(f"WebKnossos source Zarr save took {time.perf_counter() - source_save_start:.2f}s")
+
+            with webknossos_context(token=token):
+                dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
+                print(f"Uploading dataset to WebKnossos from local cache {local_dataset_path}...")
+                upload_start = time.perf_counter()
+                remote_dataset = dataset.upload()
+                print(f"WebKnossos upload took {time.perf_counter() - upload_start:.2f}s")
+                print(f"WebKnossos total build/upload time: {time.perf_counter() - total_start:.2f}s")
+                print(f"Successfully uploaded {remote_dataset.url}")
+                return True, "WebKnossos upload complete.", str(remote_dataset.url)
         except Exception as exc:
             return False, f"Failed to upload to WebKnossos: {exc}", None
