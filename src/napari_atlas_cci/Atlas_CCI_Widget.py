@@ -39,6 +39,12 @@ ONGOING = QColor("#FF9566")
 PENDING = QColor("#FFCC66")
 FAILED = QColor("#FF3333")
 UNPROCESSED = QColor("#BEBEBE")
+SELECTED_SERIES_BACKGROUND = QColor("#2F5F90")
+SERIES_STATUS_COLOR_ROLE = getattr(
+    Qt.ItemDataRole.UserRole,
+    "value",
+    Qt.ItemDataRole.UserRole,
+) + 1
 
 #TODO: Consider making these parameters adjustable in the UI, possibly through an options menu for stitching parameters.
 THREAD_COUNT = 4  # Number of threads for parallel processing (if applicable)
@@ -138,6 +144,7 @@ class AtlasCCIWidget(QWidget):
         # --- Z align part ---
         self.z_align_layout_pixel = QVBoxLayout()
         self.pixel_size_input = QHBoxLayout()
+        self.pixel_axial_label = QLabel("Axial Pixel Size:")
         self.axial_pixel_size_input = QLineEdit(str(AXIAL_PIXEL_SIZE)) #pixel size input
         self.axial_pixel_size_input.setFixedWidth(200)
         self.axial_pixel_size_input.setToolTip("Axial pixel size in microns (µm) or nanometers (nm).")
@@ -150,6 +157,7 @@ class AtlasCCIWidget(QWidget):
         self.axial_pixel_unit_dropdown.currentTextChanged.connect(self.update_pixel_size_from_input)
 
         self.pixel_size_input_widget = QWidget()
+        self.pixel_size_input.addWidget(self.pixel_axial_label)
         self.pixel_size_input.addWidget(self.axial_pixel_size_input)
         self.pixel_size_input.addWidget(self.axial_pixel_unit_dropdown)
         self.pixel_size_input_widget.setLayout(self.pixel_size_input)
@@ -526,7 +534,7 @@ class AtlasCCIWidget(QWidget):
             status_text, status_color = self._evaluate_series_status(root_folder, series_path)
 
             child_item.setText(0, f"[{status_text}] {series_path.name}")
-            child_item.setForeground(0, QBrush(status_color))
+            child_item.setData(0, SERIES_STATUS_COLOR_ROLE, status_color)
 
             has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_path)
             child_item.setToolTip(
@@ -540,6 +548,7 @@ class AtlasCCIWidget(QWidget):
                 ),
             )
 
+        self._update_selected_series_visuals()
         self.local_folder_tree.viewport().update()
         QApplication.processEvents()
         self._update_project_leaf_and_zalign_controls(root_folder)
@@ -894,8 +903,46 @@ class AtlasCCIWidget(QWidget):
 
         return None
 
-    def _on_tree_selection_changed(self) -> None:
-        self._update_display_button_state(Path(self.main_directory))
+    def _on_tree_selection_changed(self, *_) -> None:
+        root_folder = Path(self.main_directory)
+        self._update_selected_series_visuals()
+        self._update_display_button_state(root_folder)
+
+    def _update_selected_series_visuals(self) -> None:
+        root_item = self.local_folder_tree.topLevelItem(0)
+        if root_item is None:
+            return
+
+        selected_paths = {
+            selected_path
+            for selected_item in self.local_folder_tree.selectedItems()
+            if (selected_path := self._get_series_path_from_item(selected_item)) is not None
+        }
+
+        for idx in range(root_item.childCount()):
+            child_item = root_item.child(idx)
+            series_path = self._get_series_path_from_item(child_item)
+            if series_path is None:
+                continue
+
+            is_selected = series_path in selected_paths
+            status_color = child_item.data(0, SERIES_STATUS_COLOR_ROLE)
+            if not isinstance(status_color, QColor):
+                status_color = UNPROCESSED
+
+            child_item.setForeground(
+                0,
+                QBrush(QColor("#FFFFFF") if is_selected else status_color),
+            )
+            child_item.setBackground(
+                0,
+                QBrush(SELECTED_SERIES_BACKGROUND) if is_selected else QBrush(),
+            )
+            font = child_item.font(0)
+            font.setBold(is_selected)
+            child_item.setFont(0, font)
+
+        self.local_folder_tree.viewport().update()
 
     def _update_display_button_state(self, root_folder: Path) -> None:
         selected_items = self.local_folder_tree.selectedItems()
@@ -908,7 +955,8 @@ class AtlasCCIWidget(QWidget):
             self.display_btn.setEnabled(False)
             return
 
-        self.display_btn.setEnabled(self._is_series_processed(root_folder, series_path))
+        enabled = self._is_series_processed(root_folder, series_path)
+        self.display_btn.setEnabled(enabled)
 
     def _process_one_series(self, series_path: Path) -> tuple[bool, str]:
         from atlas.stitching import stitch_ATLAS_tiles
@@ -1552,11 +1600,11 @@ class AtlasCCIWidget(QWidget):
             return
 
         fixed_layer = self._get_or_create_correction_points_layer(
-            "Fixed Points",
+            "Reference Points",
             "red",
         )
         moving_layer = self._get_or_create_correction_points_layer(
-            "Moving Points",
+            "Adjustable Points",
             "blue",
         )
         if fixed_layer is None or moving_layer is None:
@@ -1565,7 +1613,7 @@ class AtlasCCIWidget(QWidget):
         self.viewer.layers.selection.active = fixed_layer
         self._set_zalign_status(
             "PENDING",
-            "Add matching points in Fixed Points and Moving Points, then apply correction",
+            "Add matching points in Reference Points and Adjustable Points, then apply correction",
             PENDING,
         )
 
@@ -1580,13 +1628,13 @@ class AtlasCCIWidget(QWidget):
             self.update_series_status_indicators(root_folder)
             return
 
-        fixed_layer = self._get_viewer_layer("Fixed Points")
-        moving_layer = self._get_viewer_layer("Moving Points")
+        fixed_layer = self._get_viewer_layer("Reference Points")
+        moving_layer = self._get_viewer_layer("Adjustable Points")
         if fixed_layer is None or moving_layer is None:
             show_error("Create correction point layers before applying correction.")
             return
         if not self._is_points_layer(fixed_layer) or not self._is_points_layer(moving_layer):
-            show_error("Fixed Points and Moving Points must be napari Points layers.")
+            show_error("Reference Points and Adjustable Points must be napari Points layers.")
             return
 
         fixed_points = np.asarray(fixed_layer.data, dtype=float)
@@ -1605,11 +1653,11 @@ class AtlasCCIWidget(QWidget):
             return
 
         if len(fixed_points) != len(moving_points):
-            show_error("The number of points in the Fixed Points layer and the Moving Points layer must be the same.")
+            show_error("The number of points in the Reference Points layer and the Adjustable Points layer must be the same.")
             return
 
         if fixed_points.shape != moving_points.shape:
-            show_error("Fixed and Moving correction points must have the same dimensionality.")
+            show_error("Reference and Adjustable correction points must have the same dimensionality.")
             return
 
         self._remove_zalign_image_layer(use_downsample=True)
