@@ -13,3 +13,21 @@ def test_napari_manifest_is_packaged():
 
     assert manifest.is_file()
     assert "napari-atlas-cci.open_widget" in manifest.read_text()
+
+
+def test_webknossos_upload_name_rejects_path_separators():
+    widget_class = import_module("napari_atlas_cci").AtlasCCIWidget
+    widget = widget_class.__new__(widget_class)
+
+    upload_name = widget._webknossos_upload_name("abc123/MyDataset")
+
+    assert upload_name == "abc123_MyDataset"
+    assert "/" not in upload_name
+
+
+def test_webknossos_upload_name_has_fallback():
+    widget_class = import_module("napari_atlas_cci").AtlasCCIWidget
+    widget = widget_class.__new__(widget_class)
+
+    assert widget._webknossos_upload_name("///") == "webknossos_dataset"
+    assert widget._webknossos_upload_name(r"folder\dataset") == "folder_dataset"
