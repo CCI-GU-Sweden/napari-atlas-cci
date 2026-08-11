@@ -1652,6 +1652,17 @@ class AtlasCCIWidget(QWidget):
     def _webknossos_ready_marker_path(self, dataset_path: Path) -> Path:
         return dataset_path.joinpath(".atlas_cci_ready")
 
+    def _webknossos_cache_root(self, root_folder: Path, dataset_name: str) -> Path:
+        import tempfile
+
+        safe_project_name = self._safe_output_name(root_folder.name)
+        safe_dataset_name = self._safe_output_name(dataset_name)
+        return Path(tempfile.gettempdir()).joinpath(
+            "atlas_cci_webknossos",
+            safe_project_name,
+            safe_dataset_name,
+        )
+
     def _axial_pixel_size_nm(self) -> float:
         axial_value = float(self.axial_pixel_size_input.text())
         axial_unit = self.axial_pixel_unit_dropdown.currentText()
@@ -1824,6 +1835,7 @@ class AtlasCCIWidget(QWidget):
     ) -> tuple[bool, str, str | None]:
         import dask.array as da
         import shutil
+        import time
         from upath import UPath
         from webknossos import Dataset, webknossos_context
         from webknossos.cli.convert_zarr import convert_zarr
@@ -1833,33 +1845,85 @@ class AtlasCCIWidget(QWidget):
         from webknossos.geometry.mag import Mag
 
         try:
-            output_root = self._webknossos_output_root(root_folder)
-            upload_source_path = self._webknossos_source_zarr_path(root_folder, dataset_name)
-            dataset_path = self._webknossos_dataset_path(root_folder, dataset_name)
-            ready_marker_path = self._webknossos_ready_marker_path(dataset_path)
-            output_root.mkdir(parents=True, exist_ok=True)
+            total_start = time.perf_counter()
+            project_output_root = self._webknossos_output_root(root_folder)
+            project_source_path = self._webknossos_source_zarr_path(root_folder, dataset_name)
+            project_dataset_path = self._webknossos_dataset_path(root_folder, dataset_name)
+            project_ready_marker_path = self._webknossos_ready_marker_path(project_dataset_path)
 
-            if not ready_marker_path.exists():
-                if dataset_path.exists():
-                    shutil.rmtree(dataset_path)
-                if upload_source_path.exists():
-                    shutil.rmtree(upload_source_path)
+            cache_root = self._webknossos_cache_root(root_folder, dataset_name)
+            local_source_path = cache_root.joinpath("source.zarr")
+            local_dataset_path = cache_root.joinpath(self._safe_output_name(dataset_name))
+            local_ready_marker_path = self._webknossos_ready_marker_path(local_dataset_path)
+            legacy_local_dataset_path = cache_root.joinpath("dataset")
 
-                print(f"Building WebKnossos dataset in {dataset_path}...")
+            project_output_root.mkdir(parents=True, exist_ok=True)
+            cache_root.mkdir(parents=True, exist_ok=True)
+            if legacy_local_dataset_path.exists() and legacy_local_dataset_path != local_dataset_path:
+                shutil.rmtree(legacy_local_dataset_path)
+            print(
+                "WebKnossos paths: "
+                f"local_source={local_source_path}, local_dataset={local_dataset_path}, "
+                f"saved_dataset={project_dataset_path}"
+            )
+
+            final_zarr_mtime = final_zarr_path.stat().st_mtime
+            if (
+                local_ready_marker_path.exists()
+                and final_zarr_mtime > local_ready_marker_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than local WebKnossos cache; rebuilding cache.")
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+                if local_source_path.exists():
+                    shutil.rmtree(local_source_path)
+            if (
+                project_ready_marker_path.exists()
+                and final_zarr_mtime > project_ready_marker_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than saved WebKnossos dataset; rebuilding saved copy.")
+                if project_dataset_path.exists():
+                    shutil.rmtree(project_dataset_path)
+                if project_source_path.exists():
+                    shutil.rmtree(project_source_path)
+
+            if not local_ready_marker_path.exists() and project_ready_marker_path.exists():
+                restore_start = time.perf_counter()
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+                print(f"Restoring local WebKnossos cache from {project_dataset_path}...")
+                shutil.copytree(project_dataset_path, local_dataset_path)
+                local_ready_marker_path.write_text("ready\n", encoding="utf-8")
+                print(f"WebKnossos cache restore took {time.perf_counter() - restore_start:.2f}s")
+
+            if not local_ready_marker_path.exists():
+                if local_dataset_path.exists():
+                    shutil.rmtree(local_dataset_path)
+
+                print(f"Building WebKnossos dataset in local cache {local_dataset_path}...")
                 source_array = da.from_zarr(str(final_zarr_path))
                 if source_array.ndim != 3:
                     raise ValueError(f"Expected 3D Zarr data, got shape {source_array.shape}.")
 
-                # Aligned Zarr is written as zyx. WebKnossos conversion expects xyz.
-                da.to_zarr(
-                    source_array.transpose(2, 1, 0),
-                    str(upload_source_path),
-                    overwrite=True,
-                )
+                if not local_source_path.exists():
+                    staging_start = time.perf_counter()
+                    # Aligned Zarr is written as zyx. WebKnossos conversion expects xyz.
+                    da.to_zarr(
+                        source_array.transpose(2, 1, 0),
+                        str(local_source_path),
+                        overwrite=True,
+                    )
+                    print(
+                        "WebKnossos data staging "
+                        f"(aligned Zarr -> local source Zarr) took {time.perf_counter() - staging_start:.2f}s"
+                    )
+                else:
+                    print(f"Reusing existing local WebKnossos source Zarr at {local_source_path}.")
 
+                convert_start = time.perf_counter()
                 convert_zarr(
-                    source_zarr_path=UPath(upload_source_path),
-                    target_path=UPath(dataset_path),
+                    source_zarr_path=UPath(local_source_path),
+                    target_path=UPath(local_dataset_path),
                     layer_name="color",
                     data_format=DataFormat.Zarr3,
                     chunk_shape=DEFAULT_CHUNK_SHAPE,
@@ -1868,20 +1932,41 @@ class AtlasCCIWidget(QWidget):
                     voxel_size_with_unit=VoxelSize(voxel_size),
                     compress=True,
                 )
+                print(f"WebKnossos conversion took {time.perf_counter() - convert_start:.2f}s")
 
-                dataset = Dataset(dataset_path, voxel_size=voxel_size, exist_ok=True)
+                downsample_start = time.perf_counter()
+                dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
                 dataset.downsample(
                     sampling_mode=SamplingModes.ANISOTROPIC,
                     coarsest_mag=Mag(32),
                 )
-                ready_marker_path.write_text("ready\n", encoding="utf-8")
+                print(f"WebKnossos downsampling took {time.perf_counter() - downsample_start:.2f}s")
+                local_ready_marker_path.write_text("ready\n", encoding="utf-8")
             else:
-                print(f"Reusing existing WebKnossos dataset at {dataset_path}.")
+                print(f"Reusing existing local WebKnossos dataset at {local_dataset_path}.")
+
+            if not project_ready_marker_path.exists():
+                save_start = time.perf_counter()
+                if project_dataset_path.exists():
+                    shutil.rmtree(project_dataset_path)
+                print(f"Saving WebKnossos dataset copy to {project_dataset_path}...")
+                shutil.copytree(local_dataset_path, project_dataset_path)
+                project_ready_marker_path.write_text("ready\n", encoding="utf-8")
+                print(f"WebKnossos dataset save took {time.perf_counter() - save_start:.2f}s")
+
+            if not project_source_path.exists() and local_source_path.exists():
+                source_save_start = time.perf_counter()
+                print(f"Saving WebKnossos source Zarr copy to {project_source_path}...")
+                shutil.copytree(local_source_path, project_source_path)
+                print(f"WebKnossos source Zarr save took {time.perf_counter() - source_save_start:.2f}s")
 
             with webknossos_context(token=token):
-                dataset = Dataset(dataset_path, voxel_size=voxel_size, exist_ok=True)
-                print(f"Uploading dataset to WebKnossos from {dataset_path}...")
+                dataset = Dataset(local_dataset_path, voxel_size=voxel_size, exist_ok=True)
+                print(f"Uploading dataset to WebKnossos from local cache {local_dataset_path}...")
+                upload_start = time.perf_counter()
                 remote_dataset = dataset.upload()
+                print(f"WebKnossos upload took {time.perf_counter() - upload_start:.2f}s")
+                print(f"WebKnossos total build/upload time: {time.perf_counter() - total_start:.2f}s")
                 print(f"Successfully uploaded {remote_dataset.url}")
                 return True, "WebKnossos upload complete.", str(remote_dataset.url)
         except Exception as exc:
