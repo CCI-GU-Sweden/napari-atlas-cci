@@ -1886,6 +1886,13 @@ class AtlasCCIWidget(QWidget):
                     shutil.rmtree(project_dataset_path)
                 if project_source_path.exists():
                     shutil.rmtree(project_source_path)
+            if (
+                not local_ready_marker_path.exists()
+                and local_source_path.exists()
+                and final_zarr_mtime > local_source_path.stat().st_mtime
+            ):
+                print("Aligned Zarr is newer than partial WebKnossos source cache; rebuilding source cache.")
+                shutil.rmtree(local_source_path)
 
             if not local_ready_marker_path.exists() and project_ready_marker_path.exists():
                 restore_start = time.perf_counter()
