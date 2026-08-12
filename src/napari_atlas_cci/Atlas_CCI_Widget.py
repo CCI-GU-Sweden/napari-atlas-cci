@@ -1683,7 +1683,7 @@ class AtlasCCIWidget(QWidget):
         return root_folder.joinpath(f"{root_folder.name}_aligned.czi")
 
     def _safe_output_name(self, name: str) -> str:
-        safe_name = re.sub(r'[<>:"/\\|?*]+', "_", name).strip(" ._")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip(" ._")
         return safe_name or "webknossos_dataset"
 
     def _webknossos_upload_name(self, dataset_name: str) -> str:
