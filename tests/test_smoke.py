@@ -19,10 +19,11 @@ def test_webknossos_upload_name_rejects_path_separators():
     widget_class = import_module("napari_atlas_cci").AtlasCCIWidget
     widget = widget_class.__new__(widget_class)
 
-    upload_name = widget._webknossos_upload_name("abc123/MyDataset")
+    upload_name = widget._webknossos_upload_name("abc123/Section Set 5")
 
-    assert upload_name == "abc123_MyDataset"
+    assert upload_name == "abc123_Section_Set_5"
     assert "/" not in upload_name
+    assert " " not in upload_name
 
 
 def test_webknossos_upload_name_has_fallback():
@@ -31,3 +32,4 @@ def test_webknossos_upload_name_has_fallback():
 
     assert widget._webknossos_upload_name("///") == "webknossos_dataset"
     assert widget._webknossos_upload_name(r"folder\dataset") == "folder_dataset"
+    assert widget._webknossos_upload_name("Section Set 5") == "Section_Set_5"
