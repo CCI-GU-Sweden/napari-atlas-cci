@@ -57,7 +57,6 @@ For easier data manipulation, it is possible to export the final alignement as a
 
 ## Troubleshooting
 
-WIP
 
 ## Contributing
 
