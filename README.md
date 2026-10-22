@@ -94,6 +94,24 @@ For easier data manipulation, it is possible to export the final alignement as a
 
 ![webknossos ulpoad success](<assets/webknossos upload.png>)
 
+After fine alignment in WebKnossos, use **Download from webknossos...** at the
+bottom of the plugin. Enter your token, the new aligned dataset's ID or full
+dataset URL, an output filename, and the destination folder (defaults to the
+current project). No local aligned output is required to use this button.
+
+The download reads the full-resolution `color` layer one Z plane at a time and
+writes that plane as CZI tiles of at most 1024 × 1024 pixels. All channels are
+preserved, XY axes are converted to CZI order, and voxel sizes are copied from
+the remote dataset. Source bounding-box offsets are rebased to CZI coordinates
+starting at zero. CZI compression follows **Options...** at download start.
+An existing destination file is never overwritten; choose a new filename.
+If a transfer fails after writing starts, a partial CZI may remain at that path.
+
+Local **Export to CZI** uses the same tiled writer and reads one aligned Zarr
+plane at a time, without loading the entire volume. Downloads run in the existing
+background export worker, with an activity indicator and completion/error
+notifications. Tokens are used for the request and are not saved in preferences.
+
 ## Troubleshooting
 
 

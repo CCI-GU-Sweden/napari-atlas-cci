@@ -10,6 +10,8 @@ from qtpy.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -223,6 +225,107 @@ class UploadDataDialog(QDialog):
 
     def _open_webknossos_token_page(self) -> None:
         QDesktopServices.openUrl(QUrl("https://webknossos.org/account/token"))
+
+
+class DownloadDataDialog(QDialog):
+    download_requested = Signal(dict)
+    _open_webknossos_token_page = UploadDataDialog._open_webknossos_token_page
+
+    def __init__(self, parent=None, location: Path | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Download from webknossos")
+        layout = QVBoxLayout(self)
+        self.token_button = QPushButton("Open WebKnossos token page")
+        self.token_button.clicked.connect(self._open_webknossos_token_page)
+        layout.addWidget(self.token_button)
+        form = QFormLayout()
+        self.wkn_token_input = QLineEdit()
+        self.wkn_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("WebKnossos token:", self.wkn_token_input)
+        self.dataset_id_input = QLineEdit()
+        self.dataset_id_input.setToolTip(
+            "ID or full URL of the fine-aligned dataset."
+        )
+        form.addRow("Dataset ID or URL:", self.dataset_id_input)
+        self.output_name_input = QLineEdit("downloaded_volume.czi")
+        form.addRow("Output filename:", self.output_name_input)
+        self.location_input = QLineEdit(str(location or Path.cwd()))
+        row = QHBoxLayout()
+        row.addWidget(self.location_input)
+        self.browse_button = QPushButton("Browse...")
+        self.browse_button.clicked.connect(self._browse_location)
+        row.addWidget(self.browse_button)
+        form.addRow("Save in:", row)
+        layout.addLayout(form)
+        info = QLabel(
+            "Downloads the full-resolution color layer. Uses CZI compression from Options."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.validation_error = QLabel()
+        self.validation_error.setWordWrap(True)
+        self.validation_error.hide()
+        layout.addWidget(self.validation_error)
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self._request_download)
+        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Download")
+        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Download")
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _browse_location(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Save downloaded CZI in", self.location_input.text()
+        )
+        if folder:
+            self.location_input.setText(folder)
+
+    def values(self):
+        token = self.wkn_token_input.text().strip()
+        dataset_id = self.dataset_id_input.text().strip()
+        name = self.output_name_input.text().strip()
+        location = Path(self.location_input.text().strip()).expanduser()
+        if not token or not dataset_id:
+            raise ValueError(
+                "Please provide a WebKnossos token and dataset ID or URL."
+            )
+        if (
+            not name
+            or any(character in name for character in '<>:"/\\|?*')
+            or name in (".", "..")
+        ):
+            raise ValueError(
+                "Provide a filename without directory separators or special characters."
+            )
+        if not Path(name).suffix:
+            name += ".czi"
+        if Path(name).suffix.lower() != ".czi" or not Path(name).stem:
+            raise ValueError("The output filename must end in .czi.")
+        if not self.location_input.text().strip() or not location.is_dir():
+            raise ValueError("Choose an existing output folder.")
+        path = location / name
+        if path.exists():
+            raise ValueError(
+                "The output file already exists. Choose a different filename."
+            )
+        return {
+            "wkn_token": token,
+            "dataset_id": dataset_id,
+            "output_path": path,
+        }
+
+    def _request_download(self):
+        try:
+            values = self.values()
+        except ValueError as exc:
+            self.validation_error.setText(str(exc))
+            self.validation_error.show()
+            return
+        self.download_requested.emit(values)
+        self.accept()
 
 
 class ZarrImageViewer:

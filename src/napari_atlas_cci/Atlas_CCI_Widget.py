@@ -28,6 +28,7 @@ from .gui import (
     LocalFolderTree,
     OptionsDialog,
     UploadDataDialog,
+    DownloadDataDialog,
     ZarrImageViewer,
 )
 from ._settings import PluginSettings, load_settings, save_settings
@@ -50,7 +51,6 @@ SERIES_STATUS_COLOR_ROLE = getattr(
 AXIAL_PIXEL_SIZE = 0.300
 AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
 ZALIGN_STATUS_MAX_CHARS = 120
-CZI_MEMORY_EXPORT_LIMIT_BYTES = 8 * 1024 ** 3
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
@@ -254,6 +254,11 @@ class AtlasCCIWidget(QWidget):
         self.export_widget = QWidget()
         self.export_widget.setLayout(self.export_layout)
         self.main_layout.addWidget(self.export_widget)
+
+        self.download_wkn_button = QPushButton("Download from webknossos...")
+        self.download_wkn_button.setToolTip("Download a fine-aligned WebKnossos dataset as a tiled CZI.")
+        self.download_wkn_button.clicked.connect(self.download_from_webknossos)
+        self.main_layout.addWidget(self.download_wkn_button)
 
         self.refresh_local_folder_tree()
         if settings_error:
@@ -709,6 +714,7 @@ class AtlasCCIWidget(QWidget):
         self.zalign_view_button.setEnabled(False)
         self.export_czi_button.setEnabled(False)
         self.upload_wkn_button.setEnabled(False)
+        self.download_wkn_button.setEnabled(False)
         if self._zalign_active_action == "initial":
             self._set_zalign_status("ONGOING", "Running initial Z alignment", ONGOING)
         elif self._zalign_active_action == "correction":
@@ -720,6 +726,7 @@ class AtlasCCIWidget(QWidget):
         self._zalign_timer.start()
 
     def _reset_zalign_buttons_idle(self) -> None:
+        self.download_wkn_button.setEnabled(not self._is_export_running())
         self._zalign_timer.stop()
         self.zalign_zshift_button.setText("Initial Z Alignment")
         self.zalign_preview_button.setText("Preview")
@@ -738,11 +745,13 @@ class AtlasCCIWidget(QWidget):
         self.zalign_view_button.setEnabled(False)
         self.export_czi_button.setEnabled(False)
         self.upload_wkn_button.setEnabled(False)
+        self.download_wkn_button.setEnabled(False)
         self._export_spinner_index = 0
         self._update_export_busy_text()
         self._export_timer.start()
 
     def _update_export_busy_text(self) -> None:
+        self.download_wkn_button.setText("Download from webknossos...")
         frame = self._zalign_spinner_frames[self._export_spinner_index]
         self._export_spinner_index = (self._export_spinner_index + 1) % len(self._zalign_spinner_frames)
 
@@ -753,7 +762,12 @@ class AtlasCCIWidget(QWidget):
             self.export_czi_button.setText("Export to CZI")
             self.upload_wkn_button.setText(f"Upload to Webknossos {frame}")
 
+        elif self._export_active_action == "webknossos_download":
+            self.download_wkn_button.setText(f"Download from webknossos {frame}")
+
     def _reset_export_buttons_idle(self) -> None:
+        self.download_wkn_button.setText("Download from webknossos...")
+        self.download_wkn_button.setEnabled(not self._is_zalign_running())
         self._export_timer.stop()
         self.export_czi_button.setText("Export to CZI")
         self.upload_wkn_button.setText("Upload to Webknossos...")
@@ -784,8 +798,8 @@ class AtlasCCIWidget(QWidget):
             show_error(message)
             return
 
-        if action == "czi":
-            show_info(f"Exported CZI: {payload}")
+        if action in {"czi", "webknossos_download"}:
+            show_info(f"Saved CZI: {payload}")
         elif action == "webknossos":
             show_info(f"Successfully uploaded {payload}")
             self.update_series_status_indicators(Path(self.main_directory))
@@ -1814,7 +1828,7 @@ class AtlasCCIWidget(QWidget):
 
     def export_to_czi(self) -> None:
         if self._is_export_running():
-            show_error("An export or upload task is already running.")
+            show_error("An export, upload, or download task is already running.")
             return
 
         zarr_path = self._final_zarr_path()
@@ -1827,12 +1841,8 @@ class AtlasCCIWidget(QWidget):
 
         czi_path = self._aligned_czi_path()
         pix_xy = float(self.pixel_size.get("Value", 1.0))
-        pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
-        compression_options = (
-            f"zstd0:ExplicitLevel={self.settings.compression_level}"
-            if self.settings.compression_enabled
-            else None
-        )
+        pix_z = self._axial_pixel_size_nm() * 1e-3
+        compression_options = self._czi_compression_options()
 
         self._export_active_action = "czi"
         self._export_future = self._export_executor.submit(
@@ -1853,62 +1863,150 @@ class AtlasCCIWidget(QWidget):
         pix_z: float,
         compression_options: str | None,
     ) -> tuple[bool, str, Path | None]:
-        from pylibCZIrw import czi as pyczi
-        import time
+        from ._czi import write_czi_volume
         import zarr
 
         try:
-            zarr_array = zarr.open_array(str(zarr_path), mode="r")
-            if len(zarr_array.shape) != 3:
-                raise ValueError(f"Expected a 3D aligned Zarr dataset, got shape {zarr_array.shape}")
-
-            dataset_bytes = int(np.prod(zarr_array.shape) * np.dtype(zarr_array.dtype).itemsize)
-            use_memory_export = dataset_bytes <= CZI_MEMORY_EXPORT_LIMIT_BYTES
-            print(
-                "CZI export source: "
-                f"path={zarr_path}, shape={zarr_array.shape}, dtype={zarr_array.dtype}, "
-                f"chunks={getattr(zarr_array, 'chunks', None)}, "
-                f"size={dataset_bytes / 1024 ** 3:.2f} GiB, "
-                f"compression={compression_options or 'none'}, "
-                f"mode={'memory' if use_memory_export else 'plane'}"
-            )
-
-            source_data = None
-            if use_memory_export:
-                load_start = time.perf_counter()
-                source_data = np.asarray(zarr_array)
-                print(f"CZI export loaded aligned Zarr into memory in {time.perf_counter() - load_start:.2f}s")
-
-            with pyczi.create_czi(
-                czi_path, exist_ok=True, compression_options=compression_options
-            ) as czidoc_w:
-                for frame in range(zarr_array.shape[0]):
-                    frame_start = time.perf_counter()
-                    if source_data is None:
-                        tmp_plane = np.asarray(zarr_array[frame, :, :]).squeeze()
-                    else:
-                        tmp_plane = np.asarray(source_data[frame, :, :]).squeeze()
-                    czidoc_w.write(data=tmp_plane[..., np.newaxis], plane={"Z": frame})
-                    print(
-                        f"CZI export wrote Z {frame + 1}/{zarr_array.shape[0]} "
-                        f"in {time.perf_counter() - frame_start:.2f}s"
-                    )
-
-                czidoc_w.write_metadata(
-                    document_name=czi_path.stem,
-                    channel_names={0: "White"},
-                    scale_x=pix_xy * 10 ** -6,
-                    scale_y=pix_xy * 10 ** -6,
-                    scale_z=pix_z * 10 ** -6,
+            source = zarr.open_array(str(zarr_path), mode="r")
+            if source.ndim != 3:
+                raise ValueError(
+                    f"Expected 3D aligned Zarr data, got shape {source.shape}."
                 )
+            planes = ((z, 0, source[z, :, :]) for z in range(source.shape[0]))
+            write_czi_volume(
+                czi_path,
+                planes,
+                (pix_xy * 1e-6, pix_xy * 1e-6, pix_z * 1e-6),
+                compression_options,
+                {0: "White"},
+                exist_ok=True,
+            )
         except Exception as exc:
             return False, f"Failed to export CZI: {exc}", None
-
         return True, "CZI export complete.", czi_path
+
+    def _czi_compression_options(self) -> str | None:
+        return (
+            f"zstd0:ExplicitLevel={self.settings.compression_level}"
+            if self.settings.compression_enabled
+            else None
+        )
+
+    def download_from_webknossos(self) -> None:
+        if self._is_export_running() or self._is_zalign_running():
+            show_error("Wait for the current processing task to finish.")
+            return
+        dialog = DownloadDataDialog(self, location=Path(self.main_directory))
+        dialog.download_requested.connect(self._download_from_webknossos)
+        self._exec_dialog(dialog)
+
+    def _download_from_webknossos(self, values: dict) -> None:
+        if self._is_export_running() or self._is_zalign_running():
+            show_error("Wait for the current processing task to finish.")
+            return
+        self._export_active_action = "webknossos_download"
+        self._export_future = self._export_executor.submit(
+            self._download_from_webknossos_worker,
+            values["wkn_token"],
+            values["dataset_id"],
+            Path(values["output_path"]),
+            self._czi_compression_options(),
+        )
+        self._set_export_buttons_busy()
+
+    def _download_from_webknossos_worker(
+        self,
+        token: str,
+        dataset_id: str,
+        output_path: Path,
+        compression_options: str | None,
+    ) -> tuple[bool, str, Path | None]:
+        from ._czi import write_czi_volume
+        from urllib.parse import urlsplit
+        import time
+        import webknossos as wk
+
+        total_start = time.perf_counter()
+        try:
+            if output_path.exists():
+                raise FileExistsError(f"Output already exists: {output_path}")
+            if not token.strip() or not dataset_id.strip():
+                raise ValueError(
+                    "Provide a WebKnossos token and dataset ID or URL."
+                )
+            dataset_id = dataset_id.strip()
+            url = urlsplit(dataset_id)
+            is_url = bool(url.scheme)
+            if is_url and (
+                url.scheme not in ("https", "http") or not url.netloc
+            ):
+                raise ValueError(
+                    "Provide a dataset ID or an HTTP(S) dataset URL."
+                )
+            server = (
+                f"{url.scheme}://{url.netloc}"
+                if is_url
+                else "https://webknossos.org"
+            )
+            with wk.webknossos_context(token=token, url=server):
+                kwargs = (
+                    {"dataset_name_or_url": dataset_id}
+                    if is_url
+                    else {"dataset_id": dataset_id}
+                )
+                dataset = wk.Dataset.open_remote(**kwargs, read_only=True)
+                if "color" not in dataset.layers:
+                    raise ValueError(
+                        f"Dataset has no color layer. Available layers: {list(dataset.layers)}"
+                    )
+                layer = dataset.get_layer("color")
+                mag = layer.get_mag(wk.Mag(1))
+                print(
+                    f"Downloading {dataset.name} from bounding box {mag.bounding_box} to {output_path}"
+                )
+                with mag.get_buffered_slice_reader(
+                    buffer_size=1, dimension="z"
+                ) as reader:
+
+                    def planes():
+                        for z, data_cxy in enumerate(reader):
+                            if data_cxy.ndim != 3:
+                                raise ValueError(
+                                    f"Expected CXY slices, got shape {data_cxy.shape}."
+                                )
+                            for channel in range(data_cxy.shape[0]):
+                                yield z, channel, data_cxy[channel].T
+                            del data_cxy
+
+                    write_czi_volume(
+                        output_path,
+                        planes(),
+                        tuple(float(v) * 1e-9 for v in dataset.voxel_size),
+                        compression_options,
+                        {
+                            c: (
+                                "color"
+                                if layer.num_channels == 1
+                                else f"color {c}"
+                            )
+                            for c in range(layer.num_channels)
+                        },
+                        document_name=dataset.name,
+                    )
+            print(
+                f"WebKnossos total download/CZI time: {time.perf_counter() - total_start:.2f}s"
+            )
+            return True, "WebKnossos download complete.", output_path
+        except Exception as exc:
+            return (
+                False,
+                f"Failed to download WebKnossos dataset as CZI: {exc}",
+                None,
+            )
 
     def upload_to_webknossos(self) -> None:
         if self._is_export_running():
-            show_error("An export or upload task is already running.")
+            show_error("An export, upload, or download task is already running.")
             return
 
         final_zarr_path = self._final_zarr_path()
@@ -1933,7 +2031,7 @@ class AtlasCCIWidget(QWidget):
 
     def _upload_to_webknossos(self, values: dict) -> None:
         if self._is_export_running():
-            show_error("An export or upload task is already running.")
+            show_error("An export, upload, or download task is already running.")
             return
 
         token = str(values.get("wkn_token", "")).strip()
