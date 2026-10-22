@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
-import os
 
 from qtpy.QtCore import Qt, QUrl, Signal
 from qtpy.QtGui import QDesktopServices
@@ -11,6 +10,7 @@ from qtpy.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QTreeWidget,
@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtGui import QIntValidator
 from qtpy.QtGui import QDoubleValidator
+from ._settings import PluginSettings
 
 class LocalFolderTree(QTreeWidget):
     def __init__(self):
@@ -70,8 +71,20 @@ class OptionsDialog(QDialog):
 
         self.downsampling_factor_input = QLineEdit(str(10))
         self.downsampling_factor_input.setToolTip("Downsampling factor for alignment.")
-        self.downsampling_factor_input.setValidator(QIntValidator(0, 100))
+        self.downsampling_factor_input.setValidator(QIntValidator(1, 100))
         self.form_layout.addRow("Downsampling factor:", self.downsampling_factor_input)
+
+        self.percentile_low_input = QLineEdit("1.0")
+        self.percentile_high_input = QLineEdit("99.95")
+        for control in (self.percentile_low_input, self.percentile_high_input):
+            control.setValidator(QDoubleValidator(0.0, 100.0, 10, control))
+            control.setToolTip(
+                "Saturation percentile used during alignment processing for saved "
+                "preview and full-resolution outputs, including manual corrections. "
+                "Requires 0 ≤ lower < upper ≤ 100."
+            )
+        self.form_layout.addRow("Lower percentile:", self.percentile_low_input)
+        self.form_layout.addRow("Upper percentile:", self.percentile_high_input)
 
         self.compression_enabled_input = QCheckBox()
         self.compression_enabled_input.setToolTip("Enable ZSTD compression for CZI output.")
@@ -88,6 +101,12 @@ class OptionsDialog(QDialog):
 
         self.main_layout.addLayout(self.form_layout)
 
+        self.validation_error = QLabel()
+        self.validation_error.setWordWrap(True)
+        self.validation_error.setStyleSheet("color: #e06060;")
+        self.validation_error.hide()
+        self.main_layout.addWidget(self.validation_error)
+
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -97,17 +116,17 @@ class OptionsDialog(QDialog):
         self.main_layout.addWidget(self.button_box)
 
     def values(self) -> dict:
-        if os.cpu_count() is not None:
-            if int(self.thread_count_input.text()) >= os.cpu_count():
-                max_threads = os.cpu_count() - 1 if os.cpu_count() > 1 else 1
-                self.thread_count_input.setText(str(max_threads))
-        return {
+        values = {
             "thread_count": int(self.thread_count_input.text()),
             "max_shift_pixels": int(self.max_shift_pixels_input.text()),
             "downsampling_factor": int(self.downsampling_factor_input.text()),
             "compression_enabled": self.compression_enabled_input.isChecked(),
             "compression_level": int(self.compression_level_input.text()),
+            "percentile_low": float(self.percentile_low_input.text()),
+            "percentile_high": float(self.percentile_high_input.text()),
         }
+        validated = PluginSettings.from_dict(values).to_dict()
+        return {key: validated[key] for key in values}
 
     def set_values(self, values: dict) -> None:
         self.thread_count_input.setText(str(values.get("thread_count", 4)))
@@ -117,12 +136,20 @@ class OptionsDialog(QDialog):
             bool(values.get("compression_enabled", True))
         )
         self.compression_level_input.setText(str(values.get("compression_level", 3)))
+        self.percentile_low_input.setText(str(values.get("percentile_low", 1.0)))
+        self.percentile_high_input.setText(str(values.get("percentile_high", 99.95)))
         self._update_compression_level_enabled(
             self.compression_enabled_input.isChecked()
         )
 
     def _accept_options(self) -> None:
-        self.options_applied.emit(self.values())
+        try:
+            values = self.values()
+        except (ValueError, OverflowError) as exc:
+            self.validation_error.setText(f"Invalid options: {exc}")
+            self.validation_error.show()
+            return
+        self.options_applied.emit(values)
         self.accept()
 
     def _update_compression_level_enabled(self, enabled: bool) -> None:

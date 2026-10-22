@@ -45,6 +45,30 @@ Once the data is aligned, it can be processed for the "Final Z Alignement". This
 
 ![Final alignment](assets/Final_align_view.png)
 
+### Options and saved preferences
+
+The **Options...** dialog includes lower and upper saturation percentiles for
+alignment processing. Defaults are **1.0** and **99.95**; values must satisfy
+`0 ≤ lower < upper ≤ 100`. They apply to saved previews, previews regenerated
+after manual correction, and full-resolution aligned outputs. Changing them
+does not modify outputs that have already been generated.
+
+Click **OK** to apply and save the Options values; **Cancel** leaves them
+unchanged. Thread count, maximum stitching shift, alignment downsampling,
+CZI compression, and both percentiles are restored next time the plugin opens.
+Axial pixel size and its explicit unit are also saved when the edit is finished
+or the unit changes. Thread count is limited to one fewer than the available CPU
+cores (with a minimum of one).
+
+Preferences are saved as readable JSON in
+`<Qt GenericConfigLocation>/napari-atlas-cci/settings.json`, under the user's
+AppData directory on Windows. They apply across projects on that computer.
+Missing preferences use the defaults; invalid files produce feedback and fall
+back to defaults. Upload tokens and project paths are excluded. This implements
+local user preferences alongside [#12](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/12);
+portable project configurations and historical run snapshots described in
+[#14](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/14) remain separate work.
+
 ### Export and upload
 
 All intermediate files are stored in the root folder of the Atlas project. Individual planes are stored as tiff images, will the alignement is stored as a pickle pandas table. The z aligned files (both the downsample and the final ones) are saved in a ome-zarr format.

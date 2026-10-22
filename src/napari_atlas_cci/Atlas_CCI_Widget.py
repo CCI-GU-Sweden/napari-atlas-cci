@@ -30,6 +30,7 @@ from .gui import (
     UploadDataDialog,
     ZarrImageViewer,
 )
+from ._settings import PluginSettings, load_settings, save_settings
 
 from atlas.io import extract_s_number
 
@@ -46,25 +47,24 @@ SERIES_STATUS_COLOR_ROLE = getattr(
     Qt.ItemDataRole.UserRole,
 ) + 1
 
-#TODO: Consider making these parameters adjustable in the UI, possibly through an options menu for stitching parameters.
-THREAD_COUNT = 4  # Number of threads for parallel processing (if applicable)
-MAX_SHIFT_PIXELS = 500  # Maximum shift in pixels for stitching (if applicable)
 AXIAL_PIXEL_SIZE = 0.300
-AXIAL_PIXEL_SIZE_UNITS = "µm" #drop down, nm and micron
 AXIAL_PIXEL_SIZE_UNITS_OPTIONS = ["nm", "µm"]
-DOWNSCALE = 10
 ZALIGN_STATUS_MAX_CHARS = 120
-ZSTDCOMPRESSION_ENABLED = True
-ZSTDCOMPRESSION = 3
 CZI_MEMORY_EXPORT_LIMIT_BYTES = 8 * 1024 ** 3
 
 class AtlasCCIWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
+        settings_error = None
+        try:
+            self.settings = load_settings()
+        except (OSError, ValueError) as exc:
+            self.settings = PluginSettings.from_dict({})
+            settings_error = f"Could not load Atlas CCI settings; using defaults: {exc}"
         self.viewer = viewer
         self.zarr_viewer = ZarrImageViewer(viewer)
         self.main_directory = Path.cwd()
-        self.pixel_size = {}
+        self.pixel_size = {"Axial": self.settings.axial_pixel_size}
 
         self.pending_series: set[Path] = set()
         self.ongoing_series: set[Path] = set()
@@ -145,15 +145,15 @@ class AtlasCCIWidget(QWidget):
         self.z_align_layout_pixel = QVBoxLayout()
         self.pixel_size_input = QHBoxLayout()
         self.pixel_axial_label = QLabel("Axial Pixel Size:")
-        self.axial_pixel_size_input = QLineEdit(str(AXIAL_PIXEL_SIZE)) #pixel size input
+        self.axial_pixel_size_input = QLineEdit(str(self.settings.axial_pixel_size))
         self.axial_pixel_size_input.setFixedWidth(200)
         self.axial_pixel_size_input.setToolTip("Axial pixel size in microns (µm) or nanometers (nm).")
         self.axial_pixel_size_input.setValidator(QDoubleValidator(0.01, 1000.0, 3))
-        self.axial_pixel_size_input.textChanged.connect(self.update_pixel_size_from_input)
+        self.axial_pixel_size_input.editingFinished.connect(self.update_pixel_size_from_input)
 
         self.axial_pixel_unit_dropdown = QComboBox()
         self.axial_pixel_unit_dropdown.addItems(AXIAL_PIXEL_SIZE_UNITS_OPTIONS)
-        self.axial_pixel_unit_dropdown.setCurrentText(AXIAL_PIXEL_SIZE_UNITS)
+        self.axial_pixel_unit_dropdown.setCurrentText(self.settings.axial_pixel_unit)
         self.axial_pixel_unit_dropdown.currentTextChanged.connect(self.update_pixel_size_from_input)
 
         self.pixel_size_input_widget = QWidget()
@@ -247,6 +247,8 @@ class AtlasCCIWidget(QWidget):
         self.main_layout.addWidget(self.export_widget)
 
         self.refresh_local_folder_tree()
+        if settings_error:
+            show_error(settings_error)
 
     def search_for_atlas_project(self, path: str|Path) -> list[Path]:
         from atlas.io import get_valid_slice_folders
@@ -577,7 +579,7 @@ class AtlasCCIWidget(QWidget):
             self.update_series_status_indicators(root_folder)
             return
 
-        worker_count = max(1, int(THREAD_COUNT))
+        worker_count = self.settings.thread_count
 
         # Queue bookkeeping for status labels.
         self._is_processing = True
@@ -781,27 +783,25 @@ class AtlasCCIWidget(QWidget):
 
     def open_options_dialog(self) -> None:
         dialog = OptionsDialog(self)
-        dialog.set_values(
-            {
-                "thread_count": THREAD_COUNT,
-                "max_shift_pixels": MAX_SHIFT_PIXELS,
-                "downsampling_factor": DOWNSCALE,
-                "compression_enabled": ZSTDCOMPRESSION_ENABLED,
-                "compression_level": ZSTDCOMPRESSION,
-            }
-        )
+        dialog.set_values(self.settings.to_dict())
         dialog.options_applied.connect(self.apply_options)
         self._exec_dialog(dialog)
 
     def apply_options(self, values: dict) -> None:
-        global THREAD_COUNT, MAX_SHIFT_PIXELS, DOWNSCALE, ZSTDCOMPRESSION_ENABLED, ZSTDCOMPRESSION
-
-        THREAD_COUNT = int(values["thread_count"])
-        MAX_SHIFT_PIXELS = int(values["max_shift_pixels"])
-        DOWNSCALE = int(values["downsampling_factor"])
-        ZSTDCOMPRESSION_ENABLED = bool(values["compression_enabled"])
-        ZSTDCOMPRESSION = int(values["compression_level"])
+        try:
+            settings = PluginSettings.from_dict(self.settings.to_dict() | values)
+        except ValueError as exc:
+            show_error(f"Invalid Atlas CCI options: {exc}")
+            return
+        self.settings = settings
+        self._save_user_settings()
         show_info("Atlas CCI options updated.")
+
+    def _save_user_settings(self) -> None:
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            show_error(f"Could not save Atlas CCI settings: {exc}")
 
     def _exec_dialog(self, dialog) -> int:
         if hasattr(dialog, "exec"):
@@ -986,7 +986,7 @@ class AtlasCCIWidget(QWidget):
                     stitched_img, mif_tile_df, transform_dict = stitch_ATLAS_tiles(
                         mif_file,
                         buffer_microns=buffer_in_microns,
-                        max_shift_pixels=MAX_SHIFT_PIXELS,
+                        max_shift_pixels=self.settings.max_shift_pixels,
                     )
 
                     # Save the full image as a TIFF file
@@ -1087,7 +1087,7 @@ class AtlasCCIWidget(QWidget):
 
         output_path = (output_root if output_root is not None else Path(self.main_directory)).joinpath("alignment_results")
         create_empty_folder(output_path)
-        z_align_df = initialize_alignment_df(tif_list_sorted, DOWNSCALE)
+        z_align_df = initialize_alignment_df(tif_list_sorted, self.settings.downsampling_factor)
         z_align_df = pairwise_alignment(z_align_df)
         z_align_df = calculate_cumulative_shifts(z_align_df)
 
@@ -1268,11 +1268,12 @@ class AtlasCCIWidget(QWidget):
         z_align_df = pd.read_pickle(z_align_df_path)
         print(z_align_df.head(5))
 
+        settings = self.settings
         zarr_array, _ = apply_alignment(
             z_align_df,
             buffer_pixels=20,
-            percentile_low=2.0,
-            percentile_high=99.95,
+            percentile_low=settings.percentile_low,
+            percentile_high=settings.percentile_high,
             use_down_sample=True,
         )
 
@@ -1307,11 +1308,12 @@ class AtlasCCIWidget(QWidget):
         z_align_df = pd.read_pickle(z_align_df_path)
         print(z_align_df.head(5))
 
+        settings = self.settings
         zarr_array, _ = apply_alignment(
             z_align_df,
             buffer_pixels=20,
-            percentile_low=2.0,
-            percentile_high=99.95,
+            percentile_low=settings.percentile_low,
+            percentile_high=settings.percentile_high,
             use_down_sample=False,
         )
 
@@ -1420,14 +1422,21 @@ class AtlasCCIWidget(QWidget):
     def update_pixel_size_from_input(self) -> bool:
         try:
             new_pixel_size = float(self.axial_pixel_size_input.text())
-            if new_pixel_size <= 0:
-                raise ValueError("Pixel size must be positive.")
+            if not np.isfinite(new_pixel_size) or not 0.01 <= new_pixel_size <= 1000:
+                raise ValueError("Pixel size must be between 0.01 and 1000.")
             self.pixel_size['Axial'] = new_pixel_size
 
             new_pixel_unit = self.axial_pixel_unit_dropdown.currentText()
             if new_pixel_unit not in AXIAL_PIXEL_SIZE_UNITS_OPTIONS:
                 raise ValueError(f"Invalid pixel size unit: {new_pixel_unit}")
 
+            settings = PluginSettings.from_dict(self.settings.to_dict() | {
+                "axial_pixel_size": new_pixel_size,
+                "axial_pixel_unit": new_pixel_unit,
+            })
+            if settings != self.settings:
+                self.settings = settings
+                self._save_user_settings()
             print(f"Updated axial pixel size to: {new_pixel_size} {new_pixel_unit}")
             return True
         except ValueError as e:
@@ -1720,8 +1729,8 @@ class AtlasCCIWidget(QWidget):
         pix_xy = float(self.pixel_size.get("Value", 1.0))
         pix_z = float(self.pixel_size.get("Axial", AXIAL_PIXEL_SIZE))
         compression_options = (
-            f"zstd0:ExplicitLevel={ZSTDCOMPRESSION}"
-            if ZSTDCOMPRESSION_ENABLED
+            f"zstd0:ExplicitLevel={self.settings.compression_level}"
+            if self.settings.compression_enabled
             else None
         )
 
