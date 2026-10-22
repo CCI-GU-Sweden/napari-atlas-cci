@@ -182,8 +182,17 @@ class AtlasCCIWidget(QWidget):
         self.z_align_layout_pixel.addWidget(self.initial_zalign_widget)
 
         self.correction_layout = QHBoxLayout()
+        self.correction_mode_dropdown = QComboBox()
+        self.correction_mode_dropdown.addItem("Trace: one point per plane", "trace")
+        self.correction_mode_dropdown.addItem("Explicit point pairs", "pairs")
+        self.correction_mode_dropdown.setToolTip(
+            "Trace: follow an object in Reference Points, one point per consecutive "
+            "Z plane, forward or backward. Gaps start separate traces. "
+            "Explicit pairs: match Reference Points with Adjustable Points."
+        )
+        self.z_align_layout_pixel.addWidget(self.correction_mode_dropdown)
         self.correction_Z_btn = QPushButton("Enter Correction")
-        self.correction_Z_btn.setToolTip("Create points layer for Z alignment.")
+        self.correction_Z_btn.setToolTip("Create the points layer(s) for the selected correction mode.")
         self.correction_Z_btn.clicked.connect(self.create_correction_points_layer)
         self.correction_Z_btn.setEnabled(False)
 
@@ -1604,7 +1613,9 @@ class AtlasCCIWidget(QWidget):
     def create_correction_points_layer(self) -> None:
         root_folder = Path(self.main_directory)
         if not self._has_z_alignment_results(root_folder):
-            show_error("Z alignment results not found. Please run initial Z alignment first.")
+            show_error(
+                "Z alignment results not found. Please run initial Z alignment first."
+            )
             self.update_series_status_indicators(root_folder)
             return
 
@@ -1612,19 +1623,73 @@ class AtlasCCIWidget(QWidget):
             "Reference Points",
             "red",
         )
-        moving_layer = self._get_or_create_correction_points_layer(
-            "Adjustable Points",
-            "blue",
-        )
-        if fixed_layer is None or moving_layer is None:
+        if fixed_layer is None:
             return
+        trace_mode = self.correction_mode_dropdown.currentData() == "trace"
+        if not trace_mode:
+            moving_layer = self._get_or_create_correction_points_layer(
+                "Adjustable Points",
+                "blue",
+            )
+            if moving_layer is None:
+                return
 
         self.viewer.layers.selection.active = fixed_layer
         self._set_zalign_status(
             "PENDING",
-            "Add matching points in Reference Points and Adjustable Points, then apply correction",
+            (
+                "Trace in Reference Points: one point per consecutive Z plane; gaps start new traces"
+                if trace_mode
+                else "Add matching points in Reference Points and Adjustable Points, then apply correction"
+            ),
             PENDING,
         )
+
+    @staticmethod
+    def _trace_correction_pairs(
+        points: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Derive adjacent pairs in click order, without joining separate traces."""
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("Trace points must have coordinates (z, y, x).")
+        if len(points) < 2:
+            raise ValueError(
+                "Add at least two Reference Points on consecutive Z slices."
+            )
+        if not np.isfinite(points).all():
+            raise ValueError(
+                "Trace points must contain only finite coordinates."
+            )
+        z = points[:, 0]
+        if np.any(z < 0) or np.any(z != np.floor(z)):
+            raise ValueError(
+                "Trace Z coordinates must be nonnegative integer slice indices."
+            )
+        slices, counts = np.unique(z, return_counts=True)
+        duplicates = slices[counts > 1]
+        if len(duplicates):
+            planes = ", ".join(f"{value:g}" for value in duplicates)
+            raise ValueError(
+                f"Only one Reference Point per Z slice is allowed; duplicates on slice(s): {planes}."
+            )
+        isolated = z[~(np.isin(z - 1, z) | np.isin(z + 1, z))]
+        if len(isolated):
+            planes = ", ".join(f"{value:g}" for value in isolated)
+            raise ValueError(
+                f"Each trace needs at least two consecutive Z slices; isolated point(s) on slice(s): {planes}."
+            )
+
+        adjacent = np.abs(np.diff(z)) == 1
+        # Every occupied adjacent slice must also be adjacent in click order.
+        # This rejects shuffled/interleaved traces rather than silently sorting.
+        if np.count_nonzero(adjacent) != np.count_nonzero(
+            np.diff(slices) == 1
+        ):
+            raise ValueError(
+                "Enter each trace in consecutive forward or backward Z order; use gaps between traces."
+            )
+        return points[:-1][adjacent].copy(), points[1:][adjacent].copy()
 
     def apply_correction(self) -> None:
         if self._is_zalign_running():
@@ -1633,40 +1698,74 @@ class AtlasCCIWidget(QWidget):
 
         root_folder = Path(self.main_directory)
         if not self._has_z_alignment_results(root_folder):
-            show_error("Z alignment results not found. Please run initial Z alignment first.")
+            show_error(
+                "Z alignment results not found. Please run initial Z alignment first."
+            )
             self.update_series_status_indicators(root_folder)
             return
 
         fixed_layer = self._get_viewer_layer("Reference Points")
-        moving_layer = self._get_viewer_layer("Adjustable Points")
-        if fixed_layer is None or moving_layer is None:
-            show_error("Create correction point layers before applying correction.")
+        if fixed_layer is None:
+            show_error("Create Reference Points before applying correction.")
             return
-        if not self._is_points_layer(fixed_layer) or not self._is_points_layer(moving_layer):
-            show_error("Reference Points and Adjustable Points must be napari Points layers.")
+        if not self._is_points_layer(fixed_layer):
+            show_error("Reference Points must be a napari Points layer.")
             return
 
-        fixed_points = np.asarray(fixed_layer.data, dtype=float)
-        moving_points = np.asarray(moving_layer.data, dtype=float)
+        moving_layer = None
+        if self.correction_mode_dropdown.currentData() == "trace":
+            try:
+                fixed_points, moving_points = self._trace_correction_pairs(
+                    fixed_layer.data
+                )
+            except ValueError as exc:
+                show_error(str(exc))
+                return
+            # ATLAS expects fixed z = moving z - 1. Reverse backward-traced
+            # pairs to that convention while retaining their trace order.
+            backward = moving_points[:, 0] < fixed_points[:, 0]
+            fixed_points[backward], moving_points[backward] = (
+                moving_points[backward].copy(),
+                fixed_points[backward].copy(),
+            )
+        else:
+            moving_layer = self._get_viewer_layer("Adjustable Points")
+            if moving_layer is None or not self._is_points_layer(moving_layer):
+                show_error(
+                    "Explicit pairs require an Adjustable Points layer."
+                )
+                return
+            fixed_points = np.asarray(fixed_layer.data, dtype=float)
+            moving_points = np.asarray(moving_layer.data, dtype=float)
 
-        print(f"Applying correction with {len(fixed_points)} fixed points and {len(moving_points)} moving points.")
+        print(
+            f"Applying correction with {len(fixed_points)} fixed points and {len(moving_points)} moving points."
+        )
         print(f"Fixed points: {fixed_points}")
         print(f"Moving points: {moving_points}")
 
         if fixed_points.ndim != 2 or moving_points.ndim != 2:
-            show_error("Correction point layers must contain coordinate arrays.")
+            show_error(
+                "Correction point layers must contain coordinate arrays."
+            )
             return
 
         if len(fixed_points) == 0:
-            show_error("Add at least one correction point pair before applying correction.")
+            show_error(
+                "Add at least one correction point pair before applying correction."
+            )
             return
 
         if len(fixed_points) != len(moving_points):
-            show_error("The number of points in the Reference Points layer and the Adjustable Points layer must be the same.")
+            show_error(
+                "The number of points in the Reference Points layer and the Adjustable Points layer must be the same."
+            )
             return
 
         if fixed_points.shape != moving_points.shape:
-            show_error("Reference and Adjustable correction points must have the same dimensionality.")
+            show_error(
+                "Reference and Adjustable correction points must have the same dimensionality."
+            )
             return
 
         self._remove_zalign_image_layer(use_downsample=True)
@@ -1680,9 +1779,10 @@ class AtlasCCIWidget(QWidget):
         )
         self._set_zalign_buttons_busy()
 
-        #delete the points layers after applying correction
+        # delete the points layers after applying correction
         self.viewer.layers.remove(fixed_layer)
-        self.viewer.layers.remove(moving_layer)
+        if moving_layer is not None:
+            self.viewer.layers.remove(moving_layer)
 
     def _final_zarr_path(self) -> Path:
         return self._aligned_zarr_path(Path(self.main_directory))

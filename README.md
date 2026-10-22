@@ -33,9 +33,24 @@ Once the initial alignement is completed, a preview image is display. Please con
 
 ![Initial align preview](<assets/Initial align preview.png>)
 
-It is possible to add correction in the alignement by clicking the "Enter Correction" button. It will create a couple of point layers, called "Fixed points" and "Moving points".
+To adjust alignment, choose a correction mode and click **Enter Correction**.
+The default, **Trace: one point per plane**, creates a single **Reference Points**
+layer. Follow the same feature through consecutive Z planes, placing one point
+per plane, consistently forward or backward. Points are used in the order you
+enter them: `[P0, P1, P2]` creates the pairs `P0 → P1` and `P1 → P2`.
 
-Move to a plane **before** the shift, and identify one striking feature with the Fixed points layer. Then move one Z-slice up, select the "Moving points" layer and identify the same feature. You can repeat as many time as necessary, however all points need to be paired.
+A gap in Z starts a separate trace. For example, points on planes
+`[2, 3, 4, 8, 9, 10]` create four pairs, never a pair from plane 4 to plane 8.
+Each trace needs at least two points. There can be only one reference point per
+plane across all traces. Duplicate planes, isolated points, and invalid ordering
+are rejected before correction starts; edit the points and try again.
+
+For the original workflow, choose **Explicit point pairs**. This creates
+**Reference Points** and **Adjustable Points**. Place matching landmarks in the
+same order in both layers, with each reference point one Z slice before its
+adjustable point. Both layers must contain the same number of points. The mode
+selector determines which workflow is used; tracing ignores any existing
+Adjustable Points layer.
 
 Once done, click on the "Apply correction" button. It will reprocess the downsample image, then display the corrected zstack. Check that the correction happen.
 
