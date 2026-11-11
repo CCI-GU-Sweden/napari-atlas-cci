@@ -41,3 +41,24 @@ def test_process_series_supports_backend_return_versions(
     assert metadata_path.exists() == with_metadata
     if with_metadata:
         assert json.loads(metadata_path.read_text()) == metadata
+        with tifffile.TiffFile(tmp_path / "stitched_image_S_1.tiff") as tif:
+            assert json.loads(tif.pages[0].description)["stitching_metadata"] == metadata
+
+
+        # Exercise the actual backend reader on the TIFF saved by the plugin.
+        from atlas.alignment import ROI
+        from atlas.io import apply_alignment
+
+        path = tmp_path / "stitched_image_S_1.tiff"
+        roi = ROI(0, 2, 0, 2)
+        frame = pd.DataFrame({
+            "moving_path": [path], "reference_path": [path],
+            "moving_ROI": [roi], "cumulative_ROI": [roi], "down_scale": [1],
+        })
+        for preview in (True, False):
+            aligned, _ = apply_alignment(
+                frame, buffer_pixels=0, use_down_sample=preview
+            )
+            assert aligned.shape == (2, 2, 1)
+            saved = aligned.attrs["AtlasMetadata"]["images"]["0"]
+            assert saved["stitching_metadata"] == metadata

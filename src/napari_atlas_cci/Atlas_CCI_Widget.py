@@ -1018,7 +1018,14 @@ class AtlasCCIWidget(QWidget):
                         stitched_img, mif_tile_df, transform_dict, stitching_metadata = stitching_result
 
                     # Save the full image as a TIFF file
-                    tiff.imwrite(output_tif_path, np.flipud(stitched_img))
+                    tiff.imwrite(
+                        output_tif_path,
+                        np.flipud(stitched_img),
+                        metadata={
+                            "axes": "YX",
+                            "stitching_metadata": stitching_metadata,
+                        },
+                    )
                     if stitching_metadata is not None:
                         metadata_path = output_tif_path.with_name(
                             output_tif_path.stem + "_metadata.json"
