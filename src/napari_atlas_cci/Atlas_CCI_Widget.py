@@ -1006,14 +1006,32 @@ class AtlasCCIWidget(QWidget):
                 print(f"🔄 Stitching image for {series_id}...")
                 
                 try:
-                    stitched_img, mif_tile_df, transform_dict = stitch_ATLAS_tiles(
+                    stitching_result = stitch_ATLAS_tiles(
                         mif_file,
                         buffer_microns=buffer_in_microns,
                         max_shift_pixels=self.settings.max_shift_pixels,
                     )
+                    if len(stitching_result) == 3:
+                        stitched_img, mif_tile_df, transform_dict = stitching_result
+                        stitching_metadata = None
+                    else:
+                        stitched_img, mif_tile_df, transform_dict, stitching_metadata = stitching_result
 
                     # Save the full image as a TIFF file
-                    tiff.imwrite(output_tif_path, np.flipud(stitched_img))
+                    tiff.imwrite(
+                        output_tif_path,
+                        np.flipud(stitched_img),
+                        metadata={
+                            "axes": "YX",
+                            "stitching_metadata": stitching_metadata,
+                        },
+                    )
+                    if stitching_metadata is not None:
+                        metadata_path = output_tif_path.with_name(
+                            output_tif_path.stem + "_metadata.json"
+                        )
+                        with open(metadata_path, "w") as f:
+                            json.dump(stitching_metadata, f, indent=4)
                     
                     mif_tile_df.to_csv(output_cc_path, index=False)
 
