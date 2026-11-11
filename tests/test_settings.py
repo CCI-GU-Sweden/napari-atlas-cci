@@ -208,3 +208,47 @@ def test_percentiles_reach_alignment_for_all_outputs(
     assert called[0]["percentile_low"] == 3.25
     assert called[0]["percentile_high"] == 97.625
     assert called[0]["use_down_sample"] is downsample
+
+
+def test_upload_xy_pixel_size_is_read_and_forwarded(widget, tmp_path, monkeypatch):
+    import pandas as pd
+
+    widget.main_directory = tmp_path
+    widget._final_zarr_path().mkdir()
+    pd.DataFrame({"PixelSizeMicron": [0.01000112]}).to_csv(
+        tmp_path / "phaseCC_stitching_S_1.csv", index=False
+    )
+    captured = []
+    monkeypatch.setattr(widget, "_exec_dialog", lambda dialog: captured.append(dialog.values()))
+    widget.upload_to_webknossos()
+    assert captured[0]["xy_pixel_size"] == pytest.approx(10.00112)
+    assert captured[0]["delete_local_dataset"] is True
+
+    submitted = []
+    monkeypatch.setattr(widget._export_executor, "submit", lambda *args: submitted.append(args))
+    monkeypatch.setattr(widget, "_set_export_buttons_busy", lambda: None)
+    widget._upload_to_webknossos({"xy_pixel_size": 12.5, "z_pixel_size": 40, "dataset_name": "test", "wkn_token": "token"})
+    assert submitted[0][-2:] == ((12.5, 12.5, 40.0), True)
+    widget._upload_to_webknossos({"xy_pixel_size": 12.5, "z_pixel_size": 40, "dataset_name": "test", "wkn_token": "token", "delete_local_dataset": False})
+    assert submitted[1][-1] is False
+
+
+def test_upload_requires_manual_xy_when_metadata_missing(widget, tmp_path, monkeypatch):
+    widget.main_directory = tmp_path
+    widget._final_zarr_path().mkdir()
+    captured = []
+    monkeypatch.setattr(widget, "_exec_dialog", lambda dialog: captured.append(dialog.xy_pixel_size_input.text()))
+    widget.upload_to_webknossos()
+    assert captured == [""]
+
+
+def test_upload_dialog_shows_actual_editable_dataset_name(widget):
+    from napari_atlas_cci.gui import UploadDataDialog
+
+    dialog = UploadDataDialog(widget)
+    dialog.set_values({"xy_pixel_size": 10, "z_pixel_size": 70, "dataset_name": "Section Set 6"})
+    assert dialog.upload_name_preview.text() == "Section_Set_6"
+    dialog.dataset_name_input.setText("My experiment 1")
+    assert dialog.upload_name_preview.text() == "My_experiment_1"
+    assert dialog.values()["dataset_name"] == "My experiment 1"
+    dialog.close()

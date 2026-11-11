@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,6 +20,7 @@ def prepare_dataset(
     voxel_size: tuple[float, float, float],
 ) -> "Dataset":
     import zarr
+    from cluster_tools import get_executor
     from webknossos import BoundingBox, Dataset
     from webknossos.dataset.sampling_modes import SamplingModes
     from webknossos.dataset_properties import DataFormat
@@ -39,6 +41,7 @@ def prepare_dataset(
 
     # Chunk writes do not necessarily update the source directory's mtime.
     # Include every file so edits to an existing aligned array invalidate reuse.
+    print("Checking aligned Zarr for a reusable WebKnossos dataset...", flush=True)
     digest = hashlib.sha256()
     for path in sorted(source_path.rglob("*")):
         if path.is_file():
@@ -61,14 +64,14 @@ def prepare_dataset(
     except (OSError, ValueError):
         ready = False
     if ready:
-        print(f"Reusing WebKnossos dataset at {dataset_path}.")
+        print(f"Reusing WebKnossos dataset at {dataset_path}.", flush=True)
         return Dataset.open(dataset_path)
 
     # This is derived output only. Legacy system-temp caches and saved source
     # copies are deliberately left untouched.
     if dataset_path.exists():
         shutil.rmtree(dataset_path)
-    print(f"Building WebKnossos dataset directly at {dataset_path}...")
+    print(f"Building WebKnossos dataset directly at {dataset_path}...", flush=True)
     dataset = Dataset(dataset_path, voxel_size=voxel_size, name=dataset_name)
     layer = dataset.add_layer(
         "color",
@@ -86,15 +89,28 @@ def prepare_dataset(
         shard_shape=shard_shape,
         compress=True,
     )
-    for box in layer.bounding_box.chunk(shard_shape):
+    total_shards = math.prod(
+        math.ceil(size / shard) for size, shard in zip(source.shape[::-1], shard_shape)
+    )
+    report_interval = max(1, math.ceil(total_shards / 20))
+    print(f"Copying aligned data: 0/{total_shards} blocks...", flush=True)
+    for count, box in enumerate(layer.bounding_box.chunk(shard_shape), start=1):
         x, y, z = box.to_slices()
         block = np.asarray(source[z, y, x]).transpose(2, 1, 0)
         mag.write(block, absolute_bounding_box=box)
-    dataset.downsample(
-        sampling_mode=SamplingModes.ANISOTROPIC,
-        coarsest_mag=Mag(32),
-    )
+        if count % report_interval == 0 or count == total_shards:
+            print(f"Copying aligned data: {count}/{total_shards} blocks ({count / total_shards:.0%})", flush=True)
+    print("Creating WebKnossos resolution pyramid...", flush=True)
+    # The library otherwise starts one process per CPU; each can use several
+    # gigabytes while downsampling large shards.
+    with get_executor("multiprocessing", max_workers=1) as executor:
+        dataset.downsample(
+            sampling_mode=SamplingModes.ANISOTROPIC,
+            coarsest_mag=Mag(32),
+            executor=executor,
+        )
     # Write only after the full pyramid succeeds; an interrupted build is rebuilt
     # on retry, while a failed upload can reuse this completed local dataset.
     marker.write_text(json.dumps(signature, sort_keys=True), encoding="utf-8")
+    print("WebKnossos dataset is ready for upload.", flush=True)
     return dataset
