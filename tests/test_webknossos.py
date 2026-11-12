@@ -11,6 +11,7 @@ import pytest
 import zarr
 from cluster_tools import SequentialExecutor
 from webknossos import Dataset
+from webknossos.dataset.layer.layer import Layer
 
 from napari_atlas_cci._webknossos import prepare_dataset
 
@@ -31,16 +32,16 @@ def project(tmp_path, monkeypatch):
 
 
 def _project(root, monkeypatch):
-    original = Dataset.downsample
+    original = Layer.downsample
     calls = []
 
     def downsample(self, **kwargs):
-        calls.append(self.path)
+        calls.append({"buffer_shape": kwargs.get("buffer_shape")})
         kwargs.pop("executor", None)
         with SequentialExecutor() as executor:
             return original(self, executor=executor, **kwargs)
 
-    monkeypatch.setattr(Dataset, "downsample", downsample)
+    monkeypatch.setattr(Layer, "downsample", downsample)
     source = root / "aligned.zarr"
     data = np.arange(9 * 37 * 261, dtype=np.uint16).reshape(9, 37, 261)
     array = zarr.open_array(
@@ -51,6 +52,7 @@ def _project(root, monkeypatch):
         dtype=data.dtype,
     )
     array[:] = data
+    array.attrs["AtlasMetadata"] = {"axes": "ZYX"}
     output = root / "webknossos" / "example"
     output.parent.mkdir()
     yield source, output, data, calls
@@ -108,23 +110,24 @@ def test_downsampling_limits_workers(project, monkeypatch):
         return SequentialExecutor()
 
     monkeypatch.setattr(cluster_tools, "get_executor", get_executor)
-    source, output, _, _ = project
+    source, output, _, downsample_calls = project
     prepare(source, output)
     assert calls == [("multiprocessing", {"max_workers": 1})]
+    assert downsample_calls == [{"buffer_shape": (128, 128, 128)}]
 
 
 def test_interrupted_build_retries_without_ready_marker(project, monkeypatch):
     source, output, data, calls = project
-    original = Dataset.downsample
+    original = Layer.downsample
 
     def interrupt(*args, **kwargs):
         raise RuntimeError("interrupted")
 
-    monkeypatch.setattr(Dataset, "downsample", interrupt)
+    monkeypatch.setattr(Layer, "downsample", interrupt)
     with pytest.raises(RuntimeError, match="interrupted"):
         prepare(source, output)
     assert not (output / ".atlas_cci_ready").exists()
-    monkeypatch.setattr(Dataset, "downsample", original)
+    monkeypatch.setattr(Layer, "downsample", original)
     prepare(source, output)
     assert (output / ".atlas_cci_ready").exists()
 
@@ -179,6 +182,7 @@ def test_real_hive_image_crop(project):
         dtype=crop.dtype,
     )
     array[:] = crop
+    array.attrs["AtlasMetadata"] = {"axes": "ZYX"}
     dataset = prepare(source, output)
     actual = dataset.get_layer("color").get_mag(1).read()[0]
     np.testing.assert_array_equal(actual, crop.transpose(2, 1, 0))
