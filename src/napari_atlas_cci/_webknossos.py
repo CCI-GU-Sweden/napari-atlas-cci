@@ -34,6 +34,9 @@ def prepare_dataset(
             "Voxel size must contain three positive finite values."
         )
     source = zarr.open_array(str(source_path), mode="r")
+    from ._zarr_axes import normalize_aligned_array_to_zyx
+
+    source, _ = normalize_aligned_array_to_zyx(source)
     if source.ndim != 3 or any(size == 0 for size in source.shape):
         raise ValueError(
             f"Expected nonempty 3D Zarr data, got shape {source.shape}."
@@ -101,14 +104,22 @@ def prepare_dataset(
         if count % report_interval == 0 or count == total_shards:
             print(f"Copying aligned data: {count}/{total_shards} blocks ({count / total_shards:.0%})", flush=True)
     print("Creating WebKnossos resolution pyramid...", flush=True)
-    # The library otherwise starts one process per CPU; each can use several
-    # gigabytes while downsampling large shards.
+    # Keep both parallelism and the per-job working buffer bounded. The
+    # WebKnossos default buffer can cover up to 1024^3 source voxels; its
+    # downsampling job may hold several arrays of that size at once.
+    downsample_buffer_shape = (128, 128, 128)
+    print(
+        "Downsampling with one worker and 128^3-voxel buffers...",
+        flush=True,
+    )
     with get_executor("multiprocessing", max_workers=1) as executor:
-        dataset.downsample(
-            sampling_mode=SamplingModes.ANISOTROPIC,
-            coarsest_mag=Mag(32),
-            executor=executor,
-        )
+        for layer in dataset.layers.values():
+            layer.downsample(
+                sampling_mode=SamplingModes.ANISOTROPIC,
+                coarsest_mag=Mag(32),
+                buffer_shape=downsample_buffer_shape,
+                executor=executor,
+            )
     # Write only after the full pyramid succeeds; an interrupted build is rebuilt
     # on retry, while a failed upload can reuse this completed local dataset.
     marker.write_text(json.dumps(signature, sort_keys=True), encoding="utf-8")

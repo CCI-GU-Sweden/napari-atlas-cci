@@ -1177,23 +1177,9 @@ class AtlasCCIWidget(QWidget):
         )
 
     def _normalize_aligned_array_axes(self, data):
-        if data.ndim not in (2, 3):
-            raise ValueError(f"Expected 2D or 3D aligned data, got shape {data.shape}.")
+        from ._zarr_axes import normalize_aligned_array_to_zyx
 
-        # Normalize 3D data to ZYX for writing/viewing.
-        if data.ndim == 3:
-            z_axis = int(np.argmin(data.shape))
-            if z_axis != 0:
-                if not isinstance(data, np.ndarray):
-                    import dask.array as da
-                    return da.moveaxis(
-                        da.from_array(data, chunks=getattr(data, "chunks", "auto")),
-                        z_axis,
-                        0,
-                    )
-                return np.moveaxis(data, z_axis, 0)
-
-        return data
+        return normalize_aligned_array_to_zyx(data)
 
     def _replace_directory_from_temp(self, temp_path: Path, final_path: Path) -> None:
         import gc
@@ -1216,6 +1202,7 @@ class AtlasCCIWidget(QWidget):
         data,
         ome_zarr_path: Path,
         layer_name: str,
+        atlas_metadata: dict | None = None,
     ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
         from ome_zarr.io import parse_url
         from ome_zarr.scale import Scaler
@@ -1264,6 +1251,9 @@ class AtlasCCIWidget(QWidget):
                 axes=axes,
                 storage_options={"chunks": chunk_shape},
             )
+
+        if atlas_metadata is not None:
+            root_group.attrs["AtlasMetadata"] = atlas_metadata
 
         print(f"Finished writing OME-Zarr pyramid: {temp_ome_zarr_path}", flush=True)
 
@@ -1332,7 +1322,7 @@ class AtlasCCIWidget(QWidget):
         )
 
         try:
-            data = self._normalize_aligned_array_axes(np.asarray(zarr_array))
+            data, atlas_metadata = self._normalize_aligned_array_axes(zarr_array)
         except ValueError as exc:
             return False, str(exc), None
 
@@ -1340,6 +1330,7 @@ class AtlasCCIWidget(QWidget):
             data,
             self._preview_ome_zarr_path(root_folder),
             root_folder.name + "_downsample",
+            atlas_metadata,
         )
         legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
         if legacy_zarr_path.exists():
@@ -1363,42 +1354,99 @@ class AtlasCCIWidget(QWidget):
         print(z_align_df.head(5))
 
         settings = self.settings
-        zarr_array, _ = apply_alignment(
-            z_align_df,
-            buffer_pixels=20,
-            percentile_low=settings.percentile_low,
-            percentile_high=settings.percentile_high,
-            use_down_sample=False,
-        )
-
-        try:
-            aligned_array = self._normalize_aligned_array_axes(zarr_array)
-        except ValueError as exc:
-            return False, str(exc), None
-
         aligned_zarr_path = self._aligned_zarr_path(root_folder)
         temp_aligned_zarr_path = aligned_zarr_path.with_name(f"{aligned_zarr_path.name}.tmp")
         if temp_aligned_zarr_path.exists():
             shutil.rmtree(temp_aligned_zarr_path)
 
-        if isinstance(aligned_array, da.Array):
-            dask_array = aligned_array
+        import inspect
+
+        alignment_kwargs = {
+            "buffer_pixels": 20,
+            "percentile_low": settings.percentile_low,
+            "percentile_high": settings.percentile_high,
+            "use_down_sample": False,
+        }
+        accepts_output_path = "output_path" in inspect.signature(
+            apply_alignment
+        ).parameters
+        if accepts_output_path:
+            print(
+                f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...",
+                flush=True,
+            )
+            zarr_array, _ = apply_alignment(
+                z_align_df,
+                **alignment_kwargs,
+                output_path=temp_aligned_zarr_path,
+            )
         else:
-            chunks = getattr(aligned_array, "chunks", None)
-            dask_array = da.from_array(aligned_array, chunks=chunks or "auto")
-        print(
-            f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...",
-            flush=True,
+            # Older backend releases only write beside the source TIFFs.
+            zarr_array, _ = apply_alignment(z_align_df, **alignment_kwargs)
+
+        try:
+            aligned_array, atlas_metadata = self._normalize_aligned_array_axes(
+                zarr_array
+            )
+        except ValueError as exc:
+            return False, str(exc), None
+
+        original_metadata = getattr(zarr_array, "attrs", {}).get(
+            "AtlasMetadata", {}
         )
-        da.to_zarr(dask_array, str(temp_aligned_zarr_path), overwrite=True)
+        needs_reorder = original_metadata.get("axes") == "YXZ"
+        if not accepts_output_path or needs_reorder:
+            if accepts_output_path:
+                normalized_temp_path = temp_aligned_zarr_path.with_name(
+                    f"{temp_aligned_zarr_path.name}.zyx"
+                )
+                if normalized_temp_path.exists():
+                    shutil.rmtree(normalized_temp_path)
+                output_path = normalized_temp_path
+            else:
+                output_path = temp_aligned_zarr_path
+
+            print(
+                f"Writing normalized full-resolution ZYX data to {output_path}...",
+                flush=True,
+            )
+            if isinstance(aligned_array, da.Array):
+                dask_array = aligned_array
+            else:
+                chunks = getattr(aligned_array, "chunks", None)
+                dask_array = da.from_array(
+                    aligned_array, chunks=chunks or "auto"
+                )
+            da.to_zarr(dask_array, str(output_path), overwrite=True)
+            from ._zarr_axes import write_atlas_metadata
+
+            write_atlas_metadata(output_path, atlas_metadata)
+            if accepts_output_path:
+                del zarr_array, aligned_array, dask_array
+                self._replace_directory_from_temp(
+                    output_path, temp_aligned_zarr_path
+                )
+            else:
+                del zarr_array, aligned_array, dask_array
+        else:
+            # The backend already wrote the declared ZYX metadata into this
+            # direct output. Release its open array before finalizing the path.
+            del zarr_array, aligned_array
 
         self._replace_directory_from_temp(temp_aligned_zarr_path, aligned_zarr_path)
+        from ._zarr_axes import write_atlas_metadata_sidecar
+
+        write_atlas_metadata_sidecar(aligned_zarr_path, atlas_metadata)
+        temp_metadata_sidecar = temp_aligned_zarr_path.with_suffix(".json")
+        if temp_metadata_sidecar != aligned_zarr_path.with_suffix(".json"):
+            temp_metadata_sidecar.unlink(missing_ok=True)
         print(f"Finished writing aligned Zarr: {aligned_zarr_path}", flush=True)
 
         ome_success, ome_message, ome_payload = self._write_ome_zarr_pyramid_from_array(
             da.from_zarr(str(aligned_zarr_path)),
             self._aligned_ome_zarr_path(root_folder),
             root_folder.name,
+            atlas_metadata,
         )
         if not ome_success or ome_payload is None:
             return False, ome_message, None
@@ -1904,10 +1952,7 @@ class AtlasCCIWidget(QWidget):
 
         try:
             source = zarr.open_array(str(zarr_path), mode="r")
-            if source.ndim != 3:
-                raise ValueError(
-                    f"Expected 3D aligned Zarr data, got shape {source.shape}."
-                )
+            source, _ = self._normalize_aligned_array_axes(source)
             planes = ((z, 0, source[z, :, :]) for z in range(source.shape[0]))
             write_czi_volume(
                 czi_path,

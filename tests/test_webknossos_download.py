@@ -139,6 +139,7 @@ def test_local_export_streams_without_loading_volume(
     class Source:
         ndim = 3
         shape = planes.shape
+        attrs = {"AtlasMetadata": {"axes": "ZYX"}}
 
         def __array__(self, *args, **kwargs):
             raise AssertionError("Do not load the entire volume")
