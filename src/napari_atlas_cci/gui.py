@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -21,7 +22,12 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtGui import QIntValidator
 from qtpy.QtGui import QDoubleValidator
+from napari.utils.notifications import show_error
 from ._settings import PluginSettings
+
+
+def safe_dataset_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip(" ._") or "webknossos_dataset"
 
 class LocalFolderTree(QTreeWidget):
     def __init__(self):
@@ -175,7 +181,7 @@ class UploadDataDialog(QDialog):
 
         self.xy_pixel_size_input = QLineEdit(str(1.0))  # Can read from the metadata
         self.xy_pixel_size_input.setToolTip("XY pixel size in nanometers.")
-        self.xy_pixel_size_input.setValidator(QDoubleValidator(0.001, 100000.0, 3))
+        self.xy_pixel_size_input.setValidator(QDoubleValidator(0.001, 100000.0, 6))
         self.form_layout.addRow("XY pixel size (nm):", self.xy_pixel_size_input)
 
         self.z_pixel_size_input = QLineEdit(str(1.0))  # Can read from the user input in the main UI
@@ -186,6 +192,10 @@ class UploadDataDialog(QDialog):
         self.dataset_name_input = QLineEdit("MyDataset")
         self.dataset_name_input.setToolTip("Name given to the dataset to upload.")
         self.form_layout.addRow("Dataset name:", self.dataset_name_input)
+        self.upload_name_preview = QLabel()
+        self.form_layout.addRow("Name on WebKnossos:", self.upload_name_preview)
+        self.dataset_name_input.textChanged.connect(self._update_upload_name_preview)
+        self._update_upload_name_preview(self.dataset_name_input.text())
 
         self.wkn_token_input = QLineEdit()
         self.wkn_token_input.setToolTip("Webknossos API token for authentication.")
@@ -196,6 +206,12 @@ class UploadDataDialog(QDialog):
         self.form_layout.addRow("WebKnossos token:", self.wkn_token_input)
 
         self.main_layout.addLayout(self.form_layout)
+
+        self.delete_local_dataset_checkbox = QCheckBox(
+            "Delete local WebKnossos dataset after successful upload"
+        )
+        self.delete_local_dataset_checkbox.setChecked(True)
+        self.main_layout.addWidget(self.delete_local_dataset_checkbox)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -211,15 +227,27 @@ class UploadDataDialog(QDialog):
             "z_pixel_size": float(self.z_pixel_size_input.text()),
             "dataset_name": self.dataset_name_input.text(),
             "wkn_token": self.wkn_token_input.text(),
+            "delete_local_dataset": self.delete_local_dataset_checkbox.isChecked(),
         }
 
+    def _update_upload_name_preview(self, name: str) -> None:
+        if not name.strip():
+            self.upload_name_preview.setText("Enter a dataset name")
+        else:
+            self.upload_name_preview.setText(safe_dataset_name(name.strip()))
+
     def set_values(self, values: dict) -> None:
-        self.xy_pixel_size_input.setText(str(values.get("xy_pixel_size", 1.0)))
+        xy_pixel_size = values.get("xy_pixel_size")
+        self.xy_pixel_size_input.setText("" if xy_pixel_size is None else str(xy_pixel_size))
         self.z_pixel_size_input.setText(str(values.get("z_pixel_size", 1.0)))
         self.dataset_name_input.setText(values.get("dataset_name", "MyDataset"))
         self.wkn_token_input.setText(values.get("wkn_token", ""))
+        self.delete_local_dataset_checkbox.setChecked(values.get("delete_local_dataset", True))
 
     def _request_upload(self) -> None:
+        if not self.xy_pixel_size_input.hasAcceptableInput() or not self.z_pixel_size_input.hasAcceptableInput():
+            show_error("Enter valid positive XY and Z pixel sizes in nanometers.")
+            return
         self.upload_requested.emit(self.values())
         self.accept()
 

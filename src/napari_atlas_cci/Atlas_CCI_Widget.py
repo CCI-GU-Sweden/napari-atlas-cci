@@ -30,6 +30,7 @@ from .gui import (
     UploadDataDialog,
     DownloadDataDialog,
     ZarrImageViewer,
+    safe_dataset_name,
 )
 from ._settings import PluginSettings, load_settings, save_settings
 
@@ -801,7 +802,7 @@ class AtlasCCIWidget(QWidget):
         if action in {"czi", "webknossos_download"}:
             show_info(f"Saved CZI: {payload}")
         elif action == "webknossos":
-            show_info(f"Successfully uploaded {payload}")
+            show_info(f"{message} {payload}")
             self.update_series_status_indicators(Path(self.main_directory))
 
     def open_options_dialog(self) -> None:
@@ -1219,6 +1220,8 @@ class AtlasCCIWidget(QWidget):
         from ome_zarr.io import parse_url
         from ome_zarr.scale import Scaler
         from ome_zarr.writer import write_image
+        import dask
+        import dask.array as da
         import shutil
         import zarr
 
@@ -1232,10 +1235,10 @@ class AtlasCCIWidget(QWidget):
 
         root_group = zarr.group(store=location.store)
 
-        # Keep Z as a single chunk while chunking Y/X for efficient reads.
+        # Bound chunk size and concurrency for large volumes.
         if data.ndim == 3:
             chunk_shape = (
-                int(data.shape[0]),
+                int(min(4, data.shape[0])),
                 int(min(512, data.shape[1])),
                 int(min(512, data.shape[2])),
             )
@@ -1247,15 +1250,22 @@ class AtlasCCIWidget(QWidget):
             )
             axes = "yx"
 
-        write_image(
-            image=data,
-            group=root_group,
-            scaler=Scaler(max_layer=4),
-            axes=axes,
-            storage_options={"chunks": chunk_shape},
+        data = da.asarray(data).rechunk(chunk_shape)
+        print(
+            f"Creating OME-Zarr pyramid at {temp_ome_zarr_path} "
+            "(this may take several minutes)...",
+            flush=True,
         )
+        with dask.config.set(scheduler="threads", num_workers=2):
+            write_image(
+                image=data,
+                group=root_group,
+                scaler=Scaler(max_layer=4),
+                axes=axes,
+                storage_options={"chunks": chunk_shape},
+            )
 
-        print(f"Wrote OME-Zarr pyramid: {temp_ome_zarr_path}")
+        print(f"Finished writing OME-Zarr pyramid: {temp_ome_zarr_path}", flush=True)
 
         attrs = dict(root_group.attrs)
         multiscales = attrs.get("multiscales", [])
@@ -1274,7 +1284,10 @@ class AtlasCCIWidget(QWidget):
 
         self._replace_directory_from_temp(temp_ome_zarr_path, ome_zarr_path)
 
-        stats_data = np.asarray(data)
+        # A regular sample keeps display contrast estimation bounded in memory.
+        print("Calculating display contrast from a sample...", flush=True)
+        stride = max(1, int(np.ceil((data.size / 1_000_000) ** (1 / data.ndim))))
+        stats_data = data[tuple(slice(None, None, stride) for _ in data.shape)].compute()
         if np.issubdtype(stats_data.dtype, np.integer):
             p_low, p_high = np.percentile(stats_data, [1.0, 99.8])
         else:
@@ -1373,12 +1386,17 @@ class AtlasCCIWidget(QWidget):
         else:
             chunks = getattr(aligned_array, "chunks", None)
             dask_array = da.from_array(aligned_array, chunks=chunks or "auto")
+        print(
+            f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...",
+            flush=True,
+        )
         da.to_zarr(dask_array, str(temp_aligned_zarr_path), overwrite=True)
 
         self._replace_directory_from_temp(temp_aligned_zarr_path, aligned_zarr_path)
+        print(f"Finished writing aligned Zarr: {aligned_zarr_path}", flush=True)
 
         ome_success, ome_message, ome_payload = self._write_ome_zarr_pyramid_from_array(
-            np.asarray(da.from_zarr(str(aligned_zarr_path))),
+            da.from_zarr(str(aligned_zarr_path)),
             self._aligned_ome_zarr_path(root_folder),
             root_folder.name,
         )
@@ -1389,6 +1407,7 @@ class AtlasCCIWidget(QWidget):
         if legacy_zarr_path.exists():
             shutil.rmtree(legacy_zarr_path)
 
+        print(f"Finished saving OME-Zarr: {self._aligned_ome_zarr_path(root_folder)}", flush=True)
         return True, "", {"aligned_zarr_path": str(aligned_zarr_path), **ome_payload}
 
     def _initial_alignement_worker(
@@ -1824,8 +1843,7 @@ class AtlasCCIWidget(QWidget):
         return root_folder.joinpath(f"{root_folder.name}_aligned.czi")
 
     def _safe_output_name(self, name: str) -> str:
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip(" ._")
-        return safe_name or "webknossos_dataset"
+        return safe_dataset_name(name)
 
     def _webknossos_upload_name(self, dataset_name: str) -> str:
         return self._safe_output_name(dataset_name)
@@ -2035,10 +2053,20 @@ class AtlasCCIWidget(QWidget):
         if not self.update_pixel_size_from_input():
             return
 
+        csv_files = sorted(Path(self.main_directory).glob("[pP]haseCC_stitching_*.csv"))
+        xy_nm = None
+        if csv_files:
+            try:
+                values = pd.to_numeric(pd.read_csv(csv_files[0])["PixelSizeMicron"], errors="coerce").dropna()
+                if not values.empty and np.isfinite(values).all() and (values > 0).all():
+                    xy_nm = round(float(values.max()) * 1000, 6)
+            except (OSError, ValueError, KeyError, pd.errors.ParserError):
+                pass
+
         dialog = UploadDataDialog(self)
         dialog.set_values(
             {
-                "xy_pixel_size": 1.0,
+                "xy_pixel_size": xy_nm,
                 "z_pixel_size": self._axial_pixel_size_nm(),
                 "dataset_name": Path(self.main_directory).name,
                 "wkn_token": "",
@@ -2066,9 +2094,10 @@ class AtlasCCIWidget(QWidget):
             show_error("Final aligned Zarr output not found.")
             return
 
+        xy_nm = float(values["xy_pixel_size"])
         voxel_size = (
-            1.0,
-            1.0,
+            xy_nm,
+            xy_nm,
             float(values.get("z_pixel_size", self._axial_pixel_size_nm())),
         )
 
@@ -2080,6 +2109,7 @@ class AtlasCCIWidget(QWidget):
             token,
             dataset_name,
             voxel_size,
+            bool(values.get("delete_local_dataset", True)),
         )
         self._set_export_buttons_busy()
 
@@ -2090,8 +2120,10 @@ class AtlasCCIWidget(QWidget):
         token: str,
         dataset_name: str,
         voxel_size: tuple[float, float, float],
+        delete_local_dataset: bool = False,
     ) -> tuple[bool, str, str | None]:
         import time
+        import shutil
         from webknossos import webknossos_context
         from ._webknossos import prepare_dataset
 
@@ -2104,10 +2136,25 @@ class AtlasCCIWidget(QWidget):
                 final_zarr_path, dataset_path, upload_dataset_name, voxel_size
             )
             with webknossos_context(token=token):
-                print(f"Uploading {upload_dataset_name} from {dataset_path}...")
+                print(f"Uploading {upload_dataset_name} from {dataset_path}...", flush=True)
                 remote_dataset = dataset.upload(new_dataset_name=upload_dataset_name)
                 print(f"WebKnossos total build/upload time: {time.perf_counter() - total_start:.2f}s")
-                print(f"Successfully uploaded {remote_dataset.url}")
-                return True, "WebKnossos upload complete.", str(remote_dataset.url)
+                remote_url = str(remote_dataset.url)
+                print(f"Successfully uploaded {remote_url}")
+                message = "WebKnossos upload complete."
+                if delete_local_dataset:
+                    try:
+                        shutil.rmtree(dataset_path)
+                        print(f"Removed local WebKnossos dataset: {dataset_path}", flush=True)
+                        try:
+                            dataset_path.parent.rmdir()
+                        except OSError:
+                            # Keep the parent when it contains other datasets.
+                            pass
+                        message += " Local WebKnossos dataset deleted."
+                    except OSError as exc:
+                        message += f" Could not delete local dataset {dataset_path}: {exc}"
+                        print(message, flush=True)
+                return True, message, remote_url
         except Exception as exc:
             return False, f"Failed to upload to WebKnossos: {exc}", None
