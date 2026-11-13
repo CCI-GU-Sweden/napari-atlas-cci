@@ -561,7 +561,7 @@ class AtlasCCIWidget(QWidget):
             self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
             self.correction_Z_btn.setEnabled(has_zcalc)
             self.correction_apply_btn.setEnabled(has_zcalc)
-            self.zalign_final_button.setEnabled(has_zcalc and not has_master)
+            self.zalign_final_button.setEnabled(has_zcalc)
             self.zalign_view_button.setEnabled(has_aligned_ome_zarr)
             self.export_czi_button.setEnabled(has_zarr)
             self.upload_wkn_button.setEnabled(has_zarr)
@@ -1444,10 +1444,21 @@ class AtlasCCIWidget(QWidget):
             "percentile_high": settings.percentile_high,
             "use_down_sample": False,
         }
-        accepts_output_path = "output_path" in inspect.signature(
-            apply_alignment
-        ).parameters
-        if accepts_output_path:
+        master_input = "store_path" in z_align_df.columns
+        if master_input:
+            from atlas.io import StitchedZarrStore, apply_alignment_zarr
+            master_path = root_folder / "stitched_sections.zarr"
+            if not master_path.is_dir():
+                return False, "Master stitched Zarr store not found.", None
+            store = StitchedZarrStore.open(master_path)
+            print(f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...", flush=True)
+            zarr_array, _ = apply_alignment_zarr(
+                z_align_df, store, **alignment_kwargs, output_path=temp_aligned_zarr_path,
+            )
+            accepts_output_path = True
+        else:
+            accepts_output_path = "output_path" in inspect.signature(apply_alignment).parameters
+        if not master_input and accepts_output_path:
             print(
                 f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...",
                 flush=True,
@@ -1457,7 +1468,7 @@ class AtlasCCIWidget(QWidget):
                 **alignment_kwargs,
                 output_path=temp_aligned_zarr_path,
             )
-        else:
+        elif not master_input:
             # Older backend releases only write beside the source TIFFs.
             zarr_array, _ = apply_alignment(z_align_df, **alignment_kwargs)
 
@@ -1529,7 +1540,7 @@ class AtlasCCIWidget(QWidget):
             return False, ome_message, None
 
         legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
-        if legacy_zarr_path.exists():
+        if legacy_zarr_path != root_folder / "stitched_sections.zarr" and legacy_zarr_path.exists():
             shutil.rmtree(legacy_zarr_path)
 
         print(f"Finished saving OME-Zarr: {self._aligned_ome_zarr_path(root_folder)}", flush=True)
