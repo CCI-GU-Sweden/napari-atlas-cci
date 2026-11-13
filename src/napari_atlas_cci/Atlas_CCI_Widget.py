@@ -2057,6 +2057,26 @@ class AtlasCCIWidget(QWidget):
             return axial_value * 1000.0
         return axial_value
 
+    def _project_xy_pixel_size_um(self, root_folder: Path) -> float | None:
+        """Read XY calibration from the master store, or legacy stitching CSV."""
+        master_path = root_folder / "stitched_sections.zarr"
+        if master_path.is_dir():
+            from atlas.io import StitchedZarrStore
+            checks = StitchedZarrStore.open(master_path).validate_section_pixel_sizes()
+            value = float(checks["Acquisition Pixel size"]["first_um"])
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("Invalid acquisition pixel size in master Zarr.")
+            return value
+        csv_files = sorted(root_folder.glob("[pP]haseCC_stitching_*.csv"))
+        if csv_files:
+            try:
+                values = pd.to_numeric(pd.read_csv(csv_files[0])["PixelSizeMicron"], errors="coerce").dropna()
+                if not values.empty and np.isfinite(values).all() and (values > 0).all():
+                    return float(values.max())
+            except (OSError, ValueError, KeyError, pd.errors.ParserError):
+                pass
+        return None
+
     def export_to_czi(self) -> None:
         if self._is_export_running():
             show_error("An export, upload, or download task is already running.")
@@ -2071,7 +2091,13 @@ class AtlasCCIWidget(QWidget):
             return
 
         czi_path = self._aligned_czi_path()
-        pix_xy = float(self.pixel_size.get("Value", 1.0))
+        try:
+            pix_xy = self._project_xy_pixel_size_um(Path(self.main_directory))
+        except Exception as exc:
+            show_error(f"Could not read XY pixel size: {exc}")
+            return
+        if pix_xy is None:
+            pix_xy = float(self.pixel_size.get("Value", 1.0))
         pix_z = self._axial_pixel_size_nm() * 1e-3
         compression_options = self._czi_compression_options()
 
@@ -2245,15 +2271,12 @@ class AtlasCCIWidget(QWidget):
         if not self.update_pixel_size_from_input():
             return
 
-        csv_files = sorted(Path(self.main_directory).glob("[pP]haseCC_stitching_*.csv"))
-        xy_nm = None
-        if csv_files:
-            try:
-                values = pd.to_numeric(pd.read_csv(csv_files[0])["PixelSizeMicron"], errors="coerce").dropna()
-                if not values.empty and np.isfinite(values).all() and (values > 0).all():
-                    xy_nm = round(float(values.max()) * 1000, 6)
-            except (OSError, ValueError, KeyError, pd.errors.ParserError):
-                pass
+        try:
+            xy_um = self._project_xy_pixel_size_um(Path(self.main_directory))
+        except Exception as exc:
+            show_error(f"Could not read XY pixel size: {exc}")
+            return
+        xy_nm = round(xy_um * 1000, 6) if xy_um is not None else None
 
         dialog = UploadDataDialog(self)
         dialog.set_values(

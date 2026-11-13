@@ -252,3 +252,27 @@ def test_upload_dialog_shows_actual_editable_dataset_name(widget):
     assert dialog.upload_name_preview.text() == "My_experiment_1"
     assert dialog.values()["dataset_name"] == "My experiment 1"
     dialog.close()
+
+
+def test_master_store_calibration_reaches_both_exports(widget, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from atlas.io import StitchedZarrStore
+
+    widget.main_directory = tmp_path
+    (tmp_path / "stitched_sections.zarr").mkdir()
+    widget._final_zarr_path().mkdir()
+    store = SimpleNamespace(validate_section_pixel_sizes=lambda: {
+        "Acquisition Pixel size": {"first_um": 0.0125}
+    })
+    monkeypatch.setattr(StitchedZarrStore, "open", lambda path: store)
+    widget.pixel_size = {}  # Reopened project: no session calibration.
+    captured = []
+    monkeypatch.setattr(widget, "_exec_dialog", lambda dialog: captured.append(dialog.values()))
+    widget.upload_to_webknossos()
+    assert captured[0]["xy_pixel_size"] == pytest.approx(12.5)
+
+    submitted = []
+    monkeypatch.setattr(widget._export_executor, "submit", lambda *args: submitted.append(args))
+    monkeypatch.setattr(widget, "_set_export_buttons_busy", lambda: None)
+    widget.export_to_czi()
+    assert submitted[0][3] == pytest.approx(0.0125)
