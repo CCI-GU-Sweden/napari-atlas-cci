@@ -559,8 +559,8 @@ class AtlasCCIWidget(QWidget):
             has_master = (root_folder / "stitched_sections.zarr").is_dir()
             self.zalign_zshift_button.setEnabled(not self._is_processing and (all_processed or has_master))
             self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
-            self.correction_Z_btn.setEnabled(has_zcalc and not has_master)
-            self.correction_apply_btn.setEnabled(has_zcalc and not has_master)
+            self.correction_Z_btn.setEnabled(has_zcalc)
+            self.correction_apply_btn.setEnabled(has_zcalc)
             self.zalign_final_button.setEnabled(has_zcalc and not has_master)
             self.zalign_view_button.setEnabled(has_aligned_ome_zarr)
             self.export_czi_button.setEnabled(has_zarr)
@@ -1366,11 +1366,14 @@ class AtlasCCIWidget(QWidget):
     def _apply_z_shifts_preview_worker(
         self,
         root_folder: Path,
+        *, alignment_path: Path | None = None,
+        preview_path: Path | None = None,
+        ome_path: Path | None = None,
     ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
         from atlas.io import apply_alignment
         import shutil
 
-        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        z_align_df_path = alignment_path or root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
         if not z_align_df_path.exists():
             return False, "Z alignment results not found. Please run the alignment first.", None
 
@@ -1382,7 +1385,7 @@ class AtlasCCIWidget(QWidget):
         if store_path.is_dir() and "store_path" in z_align_df.columns:
             from atlas.io import StitchedZarrStore, apply_alignment_zarr
             store = StitchedZarrStore.open(store_path)
-            preview_path = root_folder / "aligned_preview.zarr"
+            preview_path = preview_path or root_folder / "aligned_preview.zarr"
             zarr_array, _ = apply_alignment_zarr(
                 z_align_df, store, output_path=preview_path,
                 buffer_pixels=20, percentile_low=settings.percentile_low,
@@ -1402,7 +1405,7 @@ class AtlasCCIWidget(QWidget):
 
         success, message, payload = self._write_ome_zarr_pyramid_from_array(
             data,
-            self._preview_ome_zarr_path(root_folder),
+            ome_path or self._preview_ome_zarr_path(root_folder),
             root_folder.name + "_downsample",
             atlas_metadata,
         )
@@ -1578,13 +1581,67 @@ class AtlasCCIWidget(QWidget):
         if not backup_path.exists():
             shutil.copy2(z_align_df_path, backup_path)
 
-        corrected_z_align_df.to_pickle(z_align_df_path)
+        if "store_path" not in corrected_z_align_df.columns:
+            corrected_z_align_df.to_pickle(z_align_df_path)
+            success, message, payload = self._apply_z_shifts_preview_worker(root_folder)
+            if not success or payload is None:
+                return False, message, None
+            return True, "", {**payload, "points_count": float(len(fixed_points))}
 
-        apply_success, apply_message, apply_payload = self._apply_z_shifts_preview_worker(root_folder)
-        if not apply_success or apply_payload is None:
-            return False, apply_message, None
-
-        return True, "", {**apply_payload, "points_count": float(len(fixed_points))}
+        # Stage every artifact separately. Rename old outputs aside while
+        # finalizing so ordinary filesystem failures can be rolled back.
+        staged_df = z_align_df_path.with_name("z_alignment_results.correction.tmp.pkl")
+        staged_preview = root_folder / "aligned_preview.correction.zarr"
+        final_preview = root_folder / "aligned_preview.zarr"
+        final_ome = self._preview_ome_zarr_path(root_folder)
+        staged_ome = final_ome.with_name(final_ome.name + ".correction")
+        pairs = [(staged_preview, final_preview),
+                 (staged_preview.with_suffix(".json"), final_preview.with_suffix(".json")),
+                 (staged_ome, final_ome), (staged_df, z_align_df_path)]
+        backups = []
+        installed = []
+        try:
+            corrected_z_align_df.to_pickle(staged_df)
+            success, message, payload = self._apply_z_shifts_preview_worker(
+                root_folder, alignment_path=staged_df,
+                preview_path=staged_preview, ome_path=staged_ome,
+            )
+            if not success or payload is None:
+                return False, message, None
+            for staged, final in pairs:
+                backup = final.with_name(final.name + ".before_correction.tmp")
+                if backup.exists():
+                    raise FileExistsError(f"Recovery backup already exists: {backup}")
+                if final.exists():
+                    final.rename(backup)
+                    backups.append((backup, final))
+                staged.rename(final)
+                installed.append(final)
+            payload["ome_zarr_path"] = str(final_ome)
+            for backup, _ in backups:
+                try:
+                    if backup.is_dir():
+                        shutil.rmtree(backup)
+                    else:
+                        backup.unlink()
+                except OSError as exc:
+                    print(f"Could not remove correction backup {backup}: {exc}", flush=True)
+            return True, "", {**payload, "points_count": float(len(fixed_points))}
+        except Exception:
+            for final in reversed(installed):
+                if final.is_dir():
+                    shutil.rmtree(final)
+                elif final.exists():
+                    final.unlink()
+            for backup, final in reversed(backups):
+                backup.rename(final)
+            raise
+        finally:
+            for staged, _ in pairs:
+                if staged.is_dir():
+                    shutil.rmtree(staged)
+                elif staged.exists():
+                    staged.unlink()
 
     def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
         try:
@@ -1737,6 +1794,7 @@ class AtlasCCIWidget(QWidget):
 
     def _set_points_layer_style(self, layer, face_color: str) -> None:
         layer.size = 8
+        layer.symbol = "cross"
         layer.face_color = face_color
         if hasattr(layer, "border_color"):
             layer.border_color = "black"
@@ -1750,6 +1808,7 @@ class AtlasCCIWidget(QWidget):
             "ndim": ndim,
             "name": name,
             "size": 8,
+            "symbol": "cross",
             "face_color": face_color,
             "border_color": "black",
         }
