@@ -1,18 +1,161 @@
 # napari atlas cci
 
-Napari plugin to give a GUI interface to the cci atlas tool.
+A napari plugin for stitching and aligning array tomography data acquired with
+FIBICS ATLAS. It provides a graphical interface to the
+[CCI ATLAS backend](https://github.com/CCI-GU-Sweden/ATLAS).
 
-This is a wrapper around the [cci atlas](https://github.com/CCI-GU-Sweden/ATLAS) package.
+The workflow has been tested primarily with data acquired on the Zeiss Gemini
+SEM 450 at the Centre for Cellular Imaging (CCI), University of Gothenburg.
+See [CCI's correlative array tomography page](https://www.gu.se/index.php/en/core-facilities/core-facilities-research-infrastructures/centre-for-cellular-imaging-cci/our-services/correlative-array-tomography)
+for details of the workflow and equipment.
 
 ## Installation
 
-A standalone version of napari is available at [napari.org](https://napari.org/dev/tutorials/fundamentals/installation_bundle_conda.html), and the plugin is available on the [napari hub](https://napari-hub.org/plugins/napari-omero-downloader-cci.html). Just follow the installation instruction from napari. You can install the plugin from the plugin manager.
+The plugin requires Python **3.11 or 3.12**, napari, and a Qt backend. Its
+[ATLAS backend](https://github.com/CCI-GU-Sweden/ATLAS) is installed as a
+Python dependency; the master Zarr workflow requires `atlas-cci-align` 1.3.19
+or later.
 
-It is also possible to install the plugin from [source code](https://github.com/CCI-GU-Sweden/napari-atlas-cci) or from pip with `pip install napari-atlas-cci`. In this case, be sure to isolate the installation in a dedicated environment with napari.
+### Create an environment
+
+Install [Miniforge](https://github.com/conda-forge/miniforge) or another Conda
+distribution, then run the following in a terminal (on Windows, use a Conda
+terminal):
+
+```bash
+conda create -n atlas-napari -c conda-forge python=3.11 napari pyqt
+conda activate atlas-napari
+python -m pip install napari-atlas-cci
+napari
+```
+
+In napari, open **Plugins → Atlas CCI → AtlasCCI**. To start it again later,
+activate the environment and run `napari`. For more ways to install napari, see
+the [napari installation guide](https://napari.org/stable/tutorials/fundamentals/installation.html).
+
+### Create a desktop launcher
+
+These launchers open a terminal, activate the environment, and start napari.
+Keep the terminal open while napari runs; it also shows progress and errors.
+Replace `atlas-napari` below if you chose a different environment name.
+
+#### Windows
+
+1. Open your Conda terminal and run `conda info --base`. Note the path it
+   prints, for example `C:\Users\YourName\miniforge3`.
+2. Open Notepad and paste the following. Replace the example path with your
+   own Conda base path, keeping `\condabin\conda.bat` at the end:
+
+   ```bat
+   @echo off
+   call "C:\Users\YourName\miniforge3\condabin\conda.bat" activate atlas-napari
+   if errorlevel 1 (
+       echo Could not activate the atlas-napari environment.
+       pause
+       exit /b 1
+   )
+   napari
+   pause
+   ```
+
+3. Choose **Save As**, select **All Files** as the file type, and save it on
+   the desktop as `Launch Atlas Napari.bat` (not `.bat.txt`). Double-click it
+   to start napari. The terminal stays open after napari closes so you can read
+   any messages; press a key to close it.
+
+#### macOS
+
+1. Open Terminal and run `conda info --base`. Note the path it prints, for
+   example `/Users/yourname/miniforge3`.
+2. Open TextEdit, choose **Format → Make Plain Text**, and paste the following.
+   Replace the example path with your own Conda base path, keeping
+   `/etc/profile.d/conda.sh` at the end:
+
+   ```bash
+   #!/bin/bash
+   source "/Users/yourname/miniforge3/etc/profile.d/conda.sh" || exit 1
+   conda activate atlas-napari || exit 1
+   napari
+   ```
+
+3. Save the plain-text file on the desktop as `Launch Atlas Napari.command`.
+   In Terminal, make it executable once:
+
+   ```bash
+   chmod +x ~/Desktop/"Launch Atlas Napari.command"
+   ```
+
+   Double-click the file to open Terminal and start napari. If your Desktop is
+   stored in another location, use that file's path in the `chmod` command.
+   See [Apple's instructions for executable scripts](https://support.apple.com/guide/terminal/apdd100908f/mac).
+
+### Update an existing environment
+
+Close napari, activate the environment in which you installed the plugin, and
+update both the plugin and the ATLAS backend:
+
+```bash
+conda activate atlas-napari
+python -m pip install --upgrade napari-atlas-cci atlas-cci-align
+```
+
+Run `napari` again. To inspect the installed versions and their locations:
+
+```bash
+python -m pip show napari-atlas-cci atlas-cci-align
+```
+
+Published packages can lag behind changes merged on GitHub. An editable source
+installation uses its local checkout, so check its location before replacing it
+with a PyPI installation.
+
+### Install from source for development
+
+After creating and activating the environment above, clone this repository and
+install it in editable mode:
+
+```bash
+git clone https://github.com/CCI-GU-Sweden/napari-atlas-cci.git
+cd napari-atlas-cci
+python -m pip install -e ".[testing]"
+```
+
+Restart napari after changing plugin code. The ATLAS backend is installed from
+PyPI unless it has separately been installed from a local editable checkout.
 
 ## How to use
 
-Browse and load an atlas project. An atlas project is composed of a series of S_ folder, each containing 1 or multiple tiff images.
+### Select the ATLAS section-set folder
+
+Use **Browse...** to select the ATLAS **section set** folder: the folder that
+contains the `S_...` section folders directly. Select the section-set folder,
+not an individual `S_...` folder or the higher-level session folder. For
+example:
+
+```text
+session_740977233/
+└── Section Set 6/                         ← select this folder
+    ├── S_012_1314243284/                 ← one section
+    │   ├── MosaicInfo_S_012_1314243284.ve-mif
+    │   └── Tile_r1-c1_S_012_1314243284.tif
+    └── S_013_1234567890/
+        ├── MosaicInfo_S_013_1234567890.ve-mif
+        ├── Tile_r1-c1_S_013_1234567890.tif
+        └── Tile_r2-c1_S_013_1234567890.tif
+```
+
+Names and numbers vary between acquisitions. An S folder represents one
+section and may contain one tile or several tiles. For stitching, each section
+folder needs one `.ve-mif` acquisition metadata file and the `.tif` tiles
+listed in it. The acquisition must be marked completed in the metadata, and
+the tile names and count must match the files present. ATLAS may also create
+other files or subfolders, such as overview images and update files.
+
+The plugin lists valid S folders found directly inside the selected section
+set. If a section is missing from the list, check that its acquisition is
+complete and that its metadata and tiles are present. The plugin writes the
+master `stitched_sections.zarr` and alignment outputs alongside the S folders
+in the selected section-set folder.
 
 ![Initial status](assets/Unprocessed_folder.png)
 
@@ -24,39 +167,88 @@ For 2D stitching, select one, multiple, or all S_ folders. Stitched sections and
 
 After processing, you can select one S_ folder and display the image in Napari.
 
-### Z alignement
+### Z alignment
 
-Initial Z alignment uses completed sections in the master Zarr, in numeric section order or in the order specified by `correct_order.txt`.
-The alignement is required to run first a on downsampled image. This downsampling factor can be control in the Options.
-
-Once the initial alignement is completed, a preview image is display. Please confirm that the alignement is correct through the z volume.
+Initial Z alignment uses completed sections in the master Zarr, in numeric
+section order or in the order specified by `correct_order.txt`. Set the axial
+pixel size and unit, then click **Initial Z alignment**. The plugin calculates
+shifts and displays a downsampled preview; the downsampling factor is set in
+**Options...**. Scroll through the Z planes and inspect the alignment.
 
 ![Initial align preview](<assets/Initial align preview.png>)
 
-To adjust alignment, choose a correction mode and click **Enter Correction**.
-The default, **Trace: one point per plane**, creates a single **Reference Points**
-layer. Follow the same feature through consecutive Z planes, placing one point
-per plane, consistently forward or backward. Points are used in the order you
-enter them: `[P0, P1, P2]` creates the pairs `P0 → P1` and `P1 → P2`.
+#### Choose the section order
 
-A gap in Z starts a separate trace. For example, points on planes
-`[2, 3, 4, 8, 9, 10]` create four pairs, never a pair from plane 4 to plane 8.
-Each trace needs at least two points. There can be only one reference point per
-plane across all traces. Duplicate planes, isolated points, and invalid ordering
-are rejected before correction starts; edit the points and try again.
+By default, initial alignment uses all completed sections in ascending ATLAS
+section-number order. If a section number is missing, the backend prints a
+warning in the terminal and treats the gap as accepted: for example, it aligns
+`S_4` directly with `S_6` if `S_5` is missing. Inspect such warnings to confirm
+the gap is expected.
 
-For the original workflow, choose **Explicit point pairs**. This creates
-**Reference Points** and **Adjustable Points**. Place matching landmarks in the
-same order in both layers, with each reference point one Z slice before its
-adjustable point. Both layers must contain the same number of points. The mode
-selector determines which workflow is used; tracing ignores any existing
-Adjustable Points layer.
+To select a subset or change the order, create a plain-text file named
+`correct_order.txt` in the selected section-set folder before running
+**Initial Z alignment**.
 
-Once done, click on the "Apply correction" button. It will reprocess the downsample image, then display the corrected zstack. Check that the correction happen.
+Write ATLAS section numbers as comma-separated integers, without the `S_`
+prefix. The order in the file is the alignment order. For example:
 
-WIP: Small video Youtube to display alignement correction.
+```text
+1,...,3,6,9,...,7
+```
 
-Once the data is aligned, it can be processed for the "Final Z Alignement". This step can be time consuming based on the size of the dataset, so please, be patient.
+This selects sections `S_1, S_2, S_3, S_6, S_9, S_8, S_7`, in that order.
+The `...` token expands the range between the two numbers, including both
+ends; it works in ascending or descending order. Sections not listed are
+excluded. Every section listed or included in a range must already be complete
+in the master Zarr; otherwise initial alignment reports an error. To include a
+range with missing section numbers, list only the available sections instead.
+
+#### Correct the alignment by tracing
+
+The default mode, **Trace: one point per plane**, lets you follow the same
+recognizable feature through successive sections. The plugin turns consecutive
+points into pairs automatically, so you only need one points layer.
+
+1. Select **Trace: one point per plane** and click **Enter Correction**. The
+   plugin creates a red **Reference Points** layer and selects it for adding
+   points.
+2. On the preview, find a feature that is visible in consecutive Z planes.
+   Place a point on that feature in the first plane, move to the adjacent plane,
+   and place a point on the same feature. Continue in the same direction,
+   placing **one point per plane**. You can trace forwards or backwards.
+3. Click **Apply Correction**. The plugin calculates the correction and
+   rebuilds the preview. Inspect the new preview by scrolling through the
+   corrected planes.
+4. If further adjustment is needed, click **Enter Correction** again and place
+   **new points on the updated preview**. Repeat as needed. The correction is
+   added to the existing alignment, so reusing old points would apply the same
+   adjustment again.
+
+For example, points entered on planes `2, 3, 4` create pairs `2 → 3` and
+`3 → 4`. A gap starts a separate trace: `2, 3, 4, 8, 9, 10` creates pairs
+`2 → 3`, `3 → 4`, `8 → 9`, and `9 → 10`; it does not join planes 4 and 8.
+Each trace needs at least two consecutive planes. Enter each trace in order,
+with at most one point per plane across all traces. The plugin reports duplicate
+planes, isolated points, and invalid ordering so you can edit the points and
+try again.
+
+The original automatic alignment is saved as
+`alignment_results/z_alignment_results_before_manual_correction.pkl`. The
+latest corrected results are saved in `z_alignment_results.pkl` and used for
+final alignment.
+
+#### Alternative: explicit point pairs
+
+For the earlier two-layer workflow, select **Explicit point pairs** and click
+**Enter Correction**. The plugin creates red **Reference Points** and blue
+**Adjustable Points** layers. Add matching landmarks in the same order to both
+layers: each reference point belongs to the Z plane immediately before its
+matching adjustable point. Both layers must contain the same number of points.
+Click **Apply Correction** and inspect the regenerated preview. In trace mode,
+any existing Adjustable Points layer is ignored.
+
+When satisfied with the preview, click **Final Z Alignment** to generate the
+full-resolution output. This can take time for large datasets.
 
 ![Final alignment](assets/Final_align_view.png)
 
@@ -67,6 +259,15 @@ alignment processing. Defaults are **1.0** and **99.95**; values must satisfy
 `0 ≤ lower < upper ≤ 100`. They apply to saved previews, previews regenerated
 after manual correction, and full-resolution aligned outputs. Changing them
 does not modify outputs that have already been generated.
+
+When the plugin creates an aligned preview or full-resolution output, it
+stretches each section's intensity range using its own selected percentiles.
+This improves contrast and can make neighboring sections look more consistent.
+Values outside the stretched range are clipped to the image data type's limits.
+**This changes the saved pixel intensities relative to the original stitched
+and raw images**; it is not just a display setting. Use the original stitched
+sections in `stitched_sections.zarr` when unmodified stitched intensities are
+needed for quantitative analysis.
 
 Click **OK** to apply and save the Options values; **Cancel** leaves them
 unchanged. Thread count, maximum stitching shift, alignment downsampling,
@@ -79,20 +280,73 @@ Preferences are saved as readable JSON in
 `<Qt GenericConfigLocation>/napari-atlas-cci/settings.json`, under the user's
 AppData directory on Windows. They apply across projects on that computer.
 Missing preferences use the defaults; invalid files produce feedback and fall
-back to defaults. Upload tokens and project paths are excluded. This implements
-local user preferences alongside [#12](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/12);
+back to defaults. Upload tokens and project paths are excluded from this JSON
+file. The Browse dialog remembers the last selected project folder separately
+using Qt settings. This implements local user preferences alongside [#12](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/12);
 portable project configurations and historical run snapshots described in
 [#14](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/14) remain separate work.
 
 ### Export and upload
 
-Stitched sections are stored in `stitched_sections.zarr` in the project folder. Alignment results are saved as a pandas pickle table under `alignment_results`. The preview and full-resolution aligned data are written as Zarr arrays and OME-Zarr pyramids.
+Stitched sections and their metadata are stored in `stitched_sections.zarr` in
+the project folder. Alignment results are saved as a pandas pickle table in
+`alignment_results`. After **Final Z Alignment**, the plugin also provides the
+following outputs. The aligned arrays and exports derived from them contain
+the percentile-stretched intensities described in **Options and saved
+preferences** above.
 
-For easier data manipulation, it is possible to export the final alignement as a czi file. The other option is to upload the data on [Webknossos](https://webknossos.org/), which is great for both visualization and fine z-alignement. To do this upload, it is required to have a account on webknossos and to indicate your token for the upload.
+**Disk space and time:** The current workflow creates several copies of the
+image data for convenient viewing and export. Final alignment writes both a
+full-resolution aligned Zarr and an OME-Zarr pyramid. A WebKnossos upload also
+builds a local WebKnossos dataset and pyramid before uploading it; that local
+dataset is deleted after a successful upload by default. Allow sufficient free
+space and processing time, especially for large projects. We may review and
+reduce these intermediate copies in a future version.
 
-![Upload to webknossos](assets/upload_to_wkn.png)
+#### OME-Zarr
 
-![webknossos ulpoad success](<assets/webknossos upload.png>)
+The plugin automatically creates an OME-Zarr pyramid for the downsampled
+preview and another for the full-resolution alignment. The final pyramid is
+saved as `<project>_aligned.ome.zarr` in the project folder. Use **View** next
+to **Final Z Alignment** in the plugin or open the OME-Zarr folder with a
+compatible viewer.
+The pyramid contains multiple resolutions and carries the ATLAS alignment
+metadata. A separate full-resolution aligned Zarr array,
+`<project>_aligned.zarr`, is also saved and is used as the source for CZI and
+WebKnossos export.
+
+#### CZI
+
+Click **Export to CZI** after final alignment to write
+`<project>_aligned.czi` in the project folder. The plugin reads the aligned
+Zarr one plane at a time and writes tiled CZI data. XY pixel size comes from
+the master store and Z pixel size from the axial value and unit in the UI;
+check the axial value before exporting. CZI compression can be set in
+**Options...**. The CZI export currently writes image data and scale; retaining
+the complete alignment transform metadata is being investigated in
+[#20](https://github.com/CCI-GU-Sweden/napari-atlas-cci/issues/20).
+
+#### WebKnossos
+
+Click **Upload to Webknossos...** after final alignment. Enter your
+[WebKnossos](https://webknossos.org/) token, review the dataset name and XY/Z
+pixel sizes, and start the upload. The dialog displays the name that will be
+used and lets you edit it. XY size is read from the master store; Z size comes
+from the axial value and unit in the UI. Sizes in the upload dialog are in
+nanometers.
+
+The plugin builds a local compressed WebKnossos dataset and its resolution
+pyramid before uploading. By default, the local WebKnossos dataset is deleted
+after a successful upload; clear the checkbox to keep it. The aligned Zarr
+and OME-Zarr remain in the project folder. A successful upload displays a link
+to the dataset. An account and token are required; tokens are not saved in
+plugin preferences.
+
+![Upload to WebKnossos](assets/upload_to_wkn.png)
+
+![WebKnossos upload success](<assets/webknossos upload.png>)
+
+#### Download from WebKnossos
 
 After fine alignment in WebKnossos, use **Download from webknossos...** at the
 bottom of the plugin. Enter your token, the new aligned dataset's ID or full
@@ -107,15 +361,48 @@ starting at zero. CZI compression follows **Options...** at download start.
 An existing destination file is never overwritten; choose a new filename.
 If a transfer fails after writing starts, a partial CZI may remain at that path.
 
-Local **Export to CZI** uses the same tiled writer and reads one aligned Zarr
-plane at a time, without loading the entire volume. Downloads run in the existing
-background export worker, with an activity indicator and completion/error
-notifications. Tokens are used for the request and are not saved in preferences.
+Downloads run in a background worker, with an activity indicator and
+completion or error notifications. Tokens are used for the request and are not
+saved in preferences.
+
+## Why translation-only alignment?
+
+This alignment applies XY translations between sections. It does not apply
+rotation, scaling, or other affine transforms at this stage. Placing the
+full-resolution sections using pixel shifts avoids the interpolation that those
+transforms would require and keeps the original pixel spacing. The preview is
+downsampled, and aligned outputs have their intensities stretched as described
+in **Options and saved preferences** above, so their pixel values differ from
+the raw data. The translated volume can be used as a starting point for finer
+alignment in other tools, for example:
+
+- [WebKnossos AI Alignment](https://docs.webknossos.org/webknossos/automation/alignment.html),
+  which aligns sections after upload. See its documentation for dataset and
+  service requirements.
+- [Microscopy Image Browser (MIB) alignment](https://mib.helsinki.fi/help/main2/user-interface/menu/dataset/dataset-alignment.html),
+  part of the open-source MATLAB-based image analysis software.
+- [TrakEM2 in Fiji](https://imagej.github.io/plugins/trakem2/tutorials), which
+  includes tools for aligning serial sections.
+
+Check the chosen tool's supported input formats and import instructions before
+starting.
 
 ## Troubleshooting
 
+- **Plugin not visible:** check that napari was launched from the environment
+  where `napari-atlas-cci` is installed. Run
+  `python -m pip show napari-atlas-cci` in that environment and restart napari.
+- **Qt cannot load the `xcb` platform plugin on Linux:** check your desktop and
+  Qt runtime setup using the [napari installation guide](https://napari.org/stable/tutorials/fundamentals/installation.html).
+  When using WSL, also confirm that Linux GUI applications work in your WSL setup.
+- **WebKnossos upload:** provide an account token in the upload dialog. The
+  token is not saved in plugin preferences.
 
 ## Contributing
 
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
+Contributions are welcome. Install the source with the `testing` extra as
+shown above, then run:
+
+```bash
+python -m pytest
+```
