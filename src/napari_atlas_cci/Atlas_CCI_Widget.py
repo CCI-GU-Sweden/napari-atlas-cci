@@ -1,15 +1,16 @@
 import napari
 import re
 import textwrap
+from queue import SimpleQueue, Empty
 from pathlib import Path
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import cast
 import tifffile as tiff
 import pandas as pd
 import numpy as np
 from napari.utils.notifications import show_error
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QBrush, QColor, QDoubleValidator
 from qtpy.QtWidgets import (
     QApplication,
@@ -73,6 +74,8 @@ class AtlasCCIWidget(QWidget):
         self._is_processing = False
         self._executor: ThreadPoolExecutor | None = None
         self._series_futures: dict[Path, Future] = {}
+        self._stitch_events = SimpleQueue()
+        self._master_sections_cache = None
         self._processing_order: list[Path] = []
         self._next_queue_index = 0
         self._status_timer = QTimer(self)
@@ -299,15 +302,21 @@ class AtlasCCIWidget(QWidget):
         self.update_series_status_indicators(project_root)
 
     def browse_for_atlas_project(self) -> None:
+        preferences = QSettings("CCI-GU-Sweden", "napari-atlas-cci")
+        remembered = preferences.value("last_project_folder", "", type=str)
+        start = Path(remembered or self.path_edit.text().strip() or str(self.main_directory)).expanduser()
+        while not start.is_dir() and start != start.parent:
+            start = start.parent
+        if not start.is_dir():
+            start = Path.home()
         selected_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Select Atlas Project Folder",
-            self.path_edit.text().strip() or str(self.main_directory),
+            self, "Select Atlas Project Folder", str(start),
         )
         if not selected_dir:
             return
 
         self.main_directory = Path(selected_dir)
+        preferences.setValue("last_project_folder", str(self.main_directory))
 
         self.path_edit.setText(str(self.main_directory))
         self.refresh_local_folder_tree()
@@ -399,6 +408,26 @@ class AtlasCCIWidget(QWidget):
 
         return None
 
+    def _read_master_sections(self, root_folder: Path):
+        store_path = root_folder / "stitched_sections.zarr"
+        if not store_path.is_dir():
+            return {}
+        from atlas.io import StitchedZarrStore
+        store = StitchedZarrStore.open(store_path)
+        records = {}
+        for key in store.sections:
+            record = store.sections[key].attrs
+            source = record.get("source_folder")
+            if record.get("status") == "complete" and source:
+                records[Path(source).resolve()] = int(record["atlas_section_number"])
+        return records
+
+    def _master_store_section_number(self, root_folder: Path, series_folder: Path):
+        records = self._master_sections_cache
+        if records is None:
+            records = self._read_master_sections(root_folder)
+        return records.get(series_folder.resolve())
+
     def _evaluate_series_status(self, root_folder: Path, series_folder: Path) -> tuple[str, QColor]:
         if series_folder in self.ongoing_series:
             return "ONGOING", ONGOING
@@ -406,6 +435,9 @@ class AtlasCCIWidget(QWidget):
             return "PENDING", PENDING
         if series_folder in self.failed_series:
             return "FAILED", FAILED
+
+        if self._master_store_section_number(root_folder, series_folder) is not None:
+            return "PROCESSED", PROCESSED
 
         has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_folder)
         has_any_output = has_tiff or has_csv or has_json
@@ -430,6 +462,8 @@ class AtlasCCIWidget(QWidget):
         return "UNPROCESSED", UNPROCESSED
 
     def _is_series_processed(self, root_folder: Path, series_folder: Path) -> bool:
+        if self._master_store_section_number(root_folder, series_folder) is not None:
+            return True
         has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_folder)
         return has_tiff and has_csv and has_json
 
@@ -522,7 +556,8 @@ class AtlasCCIWidget(QWidget):
         )
 
         if not self._is_zalign_running() and not self._is_export_running():
-            self.zalign_zshift_button.setEnabled(all_processed)
+            has_master = (root_folder / "stitched_sections.zarr").is_dir()
+            self.zalign_zshift_button.setEnabled(not self._is_processing and (all_processed or has_master))
             self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
             self.correction_Z_btn.setEnabled(has_zcalc)
             self.correction_apply_btn.setEnabled(has_zcalc)
@@ -543,6 +578,7 @@ class AtlasCCIWidget(QWidget):
         if root_item is None:
             return
 
+        self._master_sections_cache = self._read_master_sections(root_folder)
         for idx in range(root_item.childCount()):
             child_item = root_item.child(idx)
             series_path = self._get_series_path_from_item(child_item)
@@ -554,11 +590,13 @@ class AtlasCCIWidget(QWidget):
             child_item.setData(0, SERIES_STATUS_COLOR_ROLE, status_color)
 
             has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_path)
+            master_section = self._master_store_section_number(root_folder, series_path)
             child_item.setToolTip(
                 0,
                 (
                     f"{series_path}\n"
                     f"Status: {status_text}\n"
+                    f"master Zarr: {f'S_{master_section}' if master_section is not None else 'not complete'}\n"
                     f"stitched tiff: {'yes' if has_tiff else 'no'}\n"
                     f"phaseCC csv: {'yes' if has_csv else 'no'}\n"
                     f"transform json: {'yes' if has_json else 'no'}"
@@ -567,9 +605,9 @@ class AtlasCCIWidget(QWidget):
 
         self._update_selected_series_visuals()
         self.local_folder_tree.viewport().update()
-        QApplication.processEvents()
         self._update_project_leaf_and_zalign_controls(root_folder)
         self._update_display_button_state(root_folder)
+        self._master_sections_cache = None
 
     def _start_processing_queue(self, series_paths: list[Path]) -> None:
         if self._is_processing:
@@ -599,27 +637,38 @@ class AtlasCCIWidget(QWidget):
         # Queue bookkeeping for status labels.
         self._is_processing = True
         self._processing_order = to_process
-        self._next_queue_index = min(worker_count, len(to_process))
-        self.pending_series = set(to_process[self._next_queue_index:])
-        self.ongoing_series = set(to_process[:self._next_queue_index])
+        self._stitch_events = SimpleQueue()
+        self.pending_series = set(to_process)
+        self.ongoing_series = set()
         self.failed_series.difference_update(set(to_process))
 
-        self._executor = ThreadPoolExecutor(max_workers=worker_count)
-        self._series_futures = {
-            series_path: self._executor.submit(self._process_one_series, series_path)
-            for series_path in to_process
-        }
+        self._series_futures = {series_path: Future() for series_path in to_process}
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._batch_future = self._executor.submit(
+            self._run_stitching_batch, root_folder, to_process,
+            worker_count, self._series_futures.copy(),
+        )
 
         self.update_series_status_indicators(root_folder)
         self._status_timer.start()
 
     def _poll_processing_futures(self) -> None:
         if not self._series_futures:
-            self._finish_processing_queue()
+            if self._batch_future.done():
+                self._finish_processing_queue()
             return
 
         root_folder = Path(self.main_directory)
         done_series: list[Path] = []
+        started = False
+        while True:
+            try:
+                path = self._stitch_events.get_nowait()
+            except Empty:
+                break
+            self.pending_series.discard(path)
+            self.ongoing_series.add(path)
+            started = True
 
         for series_path, future in self._series_futures.items():
             if not future.done():
@@ -640,20 +689,13 @@ class AtlasCCIWidget(QWidget):
                 self.failed_series.add(series_path)
                 print(f"Series failed for {series_path.name}: {error_message}")
 
-            if self._next_queue_index < len(self._processing_order):
-                next_series = self._processing_order[self._next_queue_index]
-                self._next_queue_index += 1
-                if next_series in self.pending_series:
-                    self.pending_series.discard(next_series)
-                    self.ongoing_series.add(next_series)
-
         for series_path in done_series:
             self._series_futures.pop(series_path, None)
 
-        if done_series:
+        if done_series or started:
             self.update_series_status_indicators(root_folder)
 
-        if not self._series_futures:
+        if not self._series_futures and self._batch_future.done():
             self._finish_processing_queue()
 
     def _finish_processing_queue(self) -> None:
@@ -982,77 +1024,72 @@ class AtlasCCIWidget(QWidget):
         enabled = self._is_series_processed(root_folder, series_path)
         self.display_btn.setEnabled(enabled)
 
-    def _process_one_series(self, series_path: Path) -> tuple[bool, str]:
-        from atlas.stitching import stitch_ATLAS_tiles
-        import json
+    def _run_stitching_batch(self, root_folder, series_paths, worker_count, results):
+        """Own the shared writer until all stitching threads have stopped."""
+        from atlas.io import StitchedZarrStore, get_metadata_for_stitched_tif
 
-        buffer_in_microns = 1
-        found_mif = False
-
-        print(f"Processing series folder: {series_path}")
-        first_tif_path = next(series_path.glob("*.tif"))
-        series_id = extract_s_number(first_tif_path)
-        output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_S_{series_id}.tiff")
-        output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_S_{series_id}.csv")
-        output_jason_path = Path(self.main_directory).joinpath(f"transforms_S_{series_id}.json")
-
-        for file in series_path.iterdir():
-            if file.is_file() and file.suffix.lower() in {".ve-mif"}:
-                found_mif = True
-                print(f"File with '.ve-mif' extension found: {file.name}")
-                mif_file = Path(file)
-                print(f"Output TIFF path: {output_tif_path}")
-                print(f"Output CSV path: {output_cc_path}")
-                print(f"Output JSON path: {output_jason_path}")
-                print(f"🔄 Stitching image for {series_id}...")
-                
+        prepared = []
+        try:
+            for path in series_paths:
                 try:
-                    stitching_result = stitch_ATLAS_tiles(
-                        mif_file,
-                        buffer_microns=buffer_in_microns,
-                        max_shift_pixels=self.settings.max_shift_pixels,
-                    )
-                    if len(stitching_result) == 3:
-                        stitched_img, mif_tile_df, transform_dict = stitching_result
-                        stitching_metadata = None
-                    else:
-                        stitched_img, mif_tile_df, transform_dict, stitching_metadata = stitching_result
+                    mifs = [p for p in path.iterdir()
+                            if p.is_file() and p.suffix.lower() == ".ve-mif"]
+                    if len(mifs) != 1:
+                        raise ValueError(f"Expected one .ve-mif file; found {len(mifs)}")
+                    metadata = get_metadata_for_stitched_tif(mifs[0])
+                    prepared.append((path, mifs[0], metadata))
+                except Exception as exc:
+                    results[path].set_result((False, str(exc)))
+            numbers = [item[2]["atlas_section_number"] for item in prepared]
+            if len(numbers) != len(set(numbers)):
+                raise ValueError("Selected folders contain duplicate ATLAS section numbers")
+            if not prepared:
+                return
+            prepared.sort(key=lambda item: item[2]["atlas_section_number"])
+            store = StitchedZarrStore.open(root_folder / "stitched_sections.zarr")
+            with store.parallel_writer([item[2]["atlas_section_number"] for item in prepared]) as writer:
+                with ThreadPoolExecutor(max_workers=worker_count) as workers:
+                    futures = {}
+                    for path, mif, metadata in prepared:
+                        number = metadata["atlas_section_number"]
+                        if writer.is_complete(number):
+                            source = store.sections[f"S_{number}"].attrs.get("source_folder")
+                            if source and Path(source).resolve() == path.resolve():
+                                results[path].set_result((True, ""))
+                            else:
+                                results[path].set_result((False, f"S_{number} belongs to another source folder"))
+                            continue
+                        futures[workers.submit(self._process_one_series, path, mif, metadata, writer)] = (path, number)
+                    for future in as_completed(futures):
+                        path, number = futures[future]
+                        try:
+                            future.result()
+                            results[path].set_result((True, ""))
+                        except Exception as exc:
+                            writer.mark_failed(number, exc)
+                            results[path].set_result((False, str(exc)))
+        except Exception as exc:
+            for path in series_paths:
+                if not results[path].done():
+                    results[path].set_result((False, str(exc)))
+            print(f"Stitching batch failed: {exc}", flush=True)
 
-                    # Save the full image as a TIFF file
-                    tiff.imwrite(
-                        output_tif_path,
-                        np.flipud(stitched_img),
-                        metadata={
-                            "axes": "YX",
-                            "stitching_metadata": stitching_metadata,
-                        },
-                    )
-                    if stitching_metadata is not None:
-                        metadata_path = output_tif_path.with_name(
-                            output_tif_path.stem + "_metadata.json"
-                        )
-                        with open(metadata_path, "w") as f:
-                            json.dump(stitching_metadata, f, indent=4)
-                    
-                    mif_tile_df.to_csv(output_cc_path, index=False)
+    def _process_one_series(self, series_path, mif_file, metadata, writer):
+        from atlas.stitching import stitch_ATLAS_tiles
 
-                    # Convert NumPy arrays to lists for JSON compatibility
-                    json_ready_dict = {k: v.tolist() for k, v in transform_dict.items()}
-
-                    # Save to JSON file
-                    with open(output_jason_path, "w") as f:
-                        json.dump(json_ready_dict, f, indent=2)
-                    return True, ""
-                        
-                except Exception as e:
-                    # Handle any error
-                    print(f"Unexpected error with item {file}: {e}")
-                    return False, str(e)
-
-        if not found_mif:
-            return False, "No .ve-mif file found in series folder"
-
-        return True, ""
+        number = metadata["atlas_section_number"]
+        self._stitch_events.put(series_path)
+        print(f"Stitching S_{number} into the master Zarr...", flush=True)
+        image, tile_df, transforms, stitching_metadata = stitch_ATLAS_tiles(
+            mif_file, buffer_microns=1, max_shift_pixels=self.settings.max_shift_pixels,
+        )
+        writer.write_section(
+            atlas_section_number=number, image=np.flipud(image),
+            acquisition_metadata=metadata, stitching_metadata=stitching_metadata,
+            transforms={key: value.tolist() for key, value in transforms.items()},
+            source_folder=series_path, tile_dataframe=tile_df,
+        )
+        print(f"Finished stitching S_{number} into the master Zarr.", flush=True)
 
     def process_selected_series(
         self,
@@ -1111,6 +1148,15 @@ class AtlasCCIWidget(QWidget):
             return
 
         series_id = extract_s_number(series_path.name)
+        number = self._master_store_section_number(root_folder, series_path)
+        if number is not None:
+            try:
+                from atlas.io import StitchedZarrStore
+                store = StitchedZarrStore.open(root_folder / "stitched_sections.zarr")
+                self.viewer.add_image(store.read_section(number), name=f"Stitched Image S_{number}")
+            except Exception as exc:
+                show_error(f"Failed to load stitched image: {exc}")
+            return
         stitched_image_path = self._get_stitched_image_path(root_folder, series_path)
 
         if stitched_image_path is None:
@@ -1142,6 +1188,25 @@ class AtlasCCIWidget(QWidget):
         axial_value: float,
         axial_unit: str,
     ) -> tuple[bool, str, dict[str, float | str] | None]:
+        store_path = root_folder / "stitched_sections.zarr"
+        if store_path.is_dir():
+            from atlas.io import StitchedZarrStore
+            from atlas.alignment import (
+                initialize_zarr_alignment_df, pairwise_zarr_alignment,
+                calculate_cumulative_shifts,
+            )
+            store = StitchedZarrStore.open(store_path)
+            checks = store.validate_section_pixel_sizes()
+            xy_um = float(checks["Acquisition Pixel size"]["first_um"])
+            order = store.ordered_sections(order_path=root_folder / "correct_order.txt")
+            frame = initialize_zarr_alignment_df(store, order, self.settings.downsampling_factor)
+            frame = pairwise_zarr_alignment(frame, store)
+            frame = calculate_cumulative_shifts(frame)
+            output = root_folder / "alignment_results"
+            output.mkdir(parents=True, exist_ok=True)
+            frame.to_pickle(output / "z_alignment_results.pkl")
+            return True, "", {"Value": xy_um, "Axial": float(axial_value), "Unit": axial_unit}
+
         csv_candidates = sorted(root_folder.glob("phaseCC_stitching_*.csv"))
         if not csv_candidates:
             csv_candidates = sorted(root_folder.glob("PhaseCC_stitching_*.csv"))
@@ -1301,11 +1366,14 @@ class AtlasCCIWidget(QWidget):
     def _apply_z_shifts_preview_worker(
         self,
         root_folder: Path,
+        *, alignment_path: Path | None = None,
+        preview_path: Path | None = None,
+        ome_path: Path | None = None,
     ) -> tuple[bool, str, dict[str, str | float | list[str]] | None]:
         from atlas.io import apply_alignment
         import shutil
 
-        z_align_df_path = root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
+        z_align_df_path = alignment_path or root_folder.joinpath("alignment_results", "z_alignment_results.pkl")
         if not z_align_df_path.exists():
             return False, "Z alignment results not found. Please run the alignment first.", None
 
@@ -1313,13 +1381,22 @@ class AtlasCCIWidget(QWidget):
         print(z_align_df.head(5))
 
         settings = self.settings
-        zarr_array, _ = apply_alignment(
-            z_align_df,
-            buffer_pixels=20,
-            percentile_low=settings.percentile_low,
-            percentile_high=settings.percentile_high,
-            use_down_sample=True,
-        )
+        store_path = root_folder / "stitched_sections.zarr"
+        if store_path.is_dir() and "store_path" in z_align_df.columns:
+            from atlas.io import StitchedZarrStore, apply_alignment_zarr
+            store = StitchedZarrStore.open(store_path)
+            preview_path = preview_path or root_folder / "aligned_preview.zarr"
+            zarr_array, _ = apply_alignment_zarr(
+                z_align_df, store, output_path=preview_path,
+                buffer_pixels=20, percentile_low=settings.percentile_low,
+                percentile_high=settings.percentile_high, use_down_sample=True,
+            )
+        else:
+            zarr_array, _ = apply_alignment(
+                z_align_df, buffer_pixels=20,
+                percentile_low=settings.percentile_low,
+                percentile_high=settings.percentile_high, use_down_sample=True,
+            )
 
         try:
             data, atlas_metadata = self._normalize_aligned_array_axes(zarr_array)
@@ -1328,12 +1405,12 @@ class AtlasCCIWidget(QWidget):
 
         success, message, payload = self._write_ome_zarr_pyramid_from_array(
             data,
-            self._preview_ome_zarr_path(root_folder),
+            ome_path or self._preview_ome_zarr_path(root_folder),
             root_folder.name + "_downsample",
             atlas_metadata,
         )
         legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
-        if legacy_zarr_path.exists():
+        if legacy_zarr_path != store_path and legacy_zarr_path.exists():
             shutil.rmtree(legacy_zarr_path)
 
         return success, message, payload
@@ -1367,10 +1444,21 @@ class AtlasCCIWidget(QWidget):
             "percentile_high": settings.percentile_high,
             "use_down_sample": False,
         }
-        accepts_output_path = "output_path" in inspect.signature(
-            apply_alignment
-        ).parameters
-        if accepts_output_path:
+        master_input = "store_path" in z_align_df.columns
+        if master_input:
+            from atlas.io import StitchedZarrStore, apply_alignment_zarr
+            master_path = root_folder / "stitched_sections.zarr"
+            if not master_path.is_dir():
+                return False, "Master stitched Zarr store not found.", None
+            store = StitchedZarrStore.open(master_path)
+            print(f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...", flush=True)
+            zarr_array, _ = apply_alignment_zarr(
+                z_align_df, store, **alignment_kwargs, output_path=temp_aligned_zarr_path,
+            )
+            accepts_output_path = True
+        else:
+            accepts_output_path = "output_path" in inspect.signature(apply_alignment).parameters
+        if not master_input and accepts_output_path:
             print(
                 f"Writing full-resolution aligned Zarr to {temp_aligned_zarr_path}...",
                 flush=True,
@@ -1380,7 +1468,7 @@ class AtlasCCIWidget(QWidget):
                 **alignment_kwargs,
                 output_path=temp_aligned_zarr_path,
             )
-        else:
+        elif not master_input:
             # Older backend releases only write beside the source TIFFs.
             zarr_array, _ = apply_alignment(z_align_df, **alignment_kwargs)
 
@@ -1452,7 +1540,7 @@ class AtlasCCIWidget(QWidget):
             return False, ome_message, None
 
         legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
-        if legacy_zarr_path.exists():
+        if legacy_zarr_path != root_folder / "stitched_sections.zarr" and legacy_zarr_path.exists():
             shutil.rmtree(legacy_zarr_path)
 
         print(f"Finished saving OME-Zarr: {self._aligned_ome_zarr_path(root_folder)}", flush=True)
@@ -1504,13 +1592,67 @@ class AtlasCCIWidget(QWidget):
         if not backup_path.exists():
             shutil.copy2(z_align_df_path, backup_path)
 
-        corrected_z_align_df.to_pickle(z_align_df_path)
+        if "store_path" not in corrected_z_align_df.columns:
+            corrected_z_align_df.to_pickle(z_align_df_path)
+            success, message, payload = self._apply_z_shifts_preview_worker(root_folder)
+            if not success or payload is None:
+                return False, message, None
+            return True, "", {**payload, "points_count": float(len(fixed_points))}
 
-        apply_success, apply_message, apply_payload = self._apply_z_shifts_preview_worker(root_folder)
-        if not apply_success or apply_payload is None:
-            return False, apply_message, None
-
-        return True, "", {**apply_payload, "points_count": float(len(fixed_points))}
+        # Stage every artifact separately. Rename old outputs aside while
+        # finalizing so ordinary filesystem failures can be rolled back.
+        staged_df = z_align_df_path.with_name("z_alignment_results.correction.tmp.pkl")
+        staged_preview = root_folder / "aligned_preview.correction.zarr"
+        final_preview = root_folder / "aligned_preview.zarr"
+        final_ome = self._preview_ome_zarr_path(root_folder)
+        staged_ome = final_ome.with_name(final_ome.name + ".correction")
+        pairs = [(staged_preview, final_preview),
+                 (staged_preview.with_suffix(".json"), final_preview.with_suffix(".json")),
+                 (staged_ome, final_ome), (staged_df, z_align_df_path)]
+        backups = []
+        installed = []
+        try:
+            corrected_z_align_df.to_pickle(staged_df)
+            success, message, payload = self._apply_z_shifts_preview_worker(
+                root_folder, alignment_path=staged_df,
+                preview_path=staged_preview, ome_path=staged_ome,
+            )
+            if not success or payload is None:
+                return False, message, None
+            for staged, final in pairs:
+                backup = final.with_name(final.name + ".before_correction.tmp")
+                if backup.exists():
+                    raise FileExistsError(f"Recovery backup already exists: {backup}")
+                if final.exists():
+                    final.rename(backup)
+                    backups.append((backup, final))
+                staged.rename(final)
+                installed.append(final)
+            payload["ome_zarr_path"] = str(final_ome)
+            for backup, _ in backups:
+                try:
+                    if backup.is_dir():
+                        shutil.rmtree(backup)
+                    else:
+                        backup.unlink()
+                except OSError as exc:
+                    print(f"Could not remove correction backup {backup}: {exc}", flush=True)
+            return True, "", {**payload, "points_count": float(len(fixed_points))}
+        except Exception:
+            for final in reversed(installed):
+                if final.is_dir():
+                    shutil.rmtree(final)
+                elif final.exists():
+                    final.unlink()
+            for backup, final in reversed(backups):
+                backup.rename(final)
+            raise
+        finally:
+            for staged, _ in pairs:
+                if staged.is_dir():
+                    shutil.rmtree(staged)
+                elif staged.exists():
+                    staged.unlink()
 
     def _finalize_apply_z_shifts(self, payload: dict[str, str | float | list[str]]) -> tuple[bool, str]:
         try:
@@ -1559,7 +1701,10 @@ class AtlasCCIWidget(QWidget):
             return
 
         root_folder = Path(self.main_directory)
-        if not self._all_series_processed(root_folder):
+        if self._is_processing:
+            show_error("Wait for stitching to finish before starting Z alignment.")
+            return
+        if not (root_folder / "stitched_sections.zarr").is_dir() and not self._all_series_processed(root_folder):
             show_error("Initial Z alignment requires all series to be processed first.")
             self.update_series_status_indicators(root_folder)
             return
@@ -1660,6 +1805,7 @@ class AtlasCCIWidget(QWidget):
 
     def _set_points_layer_style(self, layer, face_color: str) -> None:
         layer.size = 8
+        layer.symbol = "cross"
         layer.face_color = face_color
         if hasattr(layer, "border_color"):
             layer.border_color = "black"
@@ -1673,6 +1819,7 @@ class AtlasCCIWidget(QWidget):
             "ndim": ndim,
             "name": name,
             "size": 8,
+            "symbol": "cross",
             "face_color": face_color,
             "border_color": "black",
         }
@@ -1910,6 +2057,26 @@ class AtlasCCIWidget(QWidget):
             return axial_value * 1000.0
         return axial_value
 
+    def _project_xy_pixel_size_um(self, root_folder: Path) -> float | None:
+        """Read XY calibration from the master store, or legacy stitching CSV."""
+        master_path = root_folder / "stitched_sections.zarr"
+        if master_path.is_dir():
+            from atlas.io import StitchedZarrStore
+            checks = StitchedZarrStore.open(master_path).validate_section_pixel_sizes()
+            value = float(checks["Acquisition Pixel size"]["first_um"])
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("Invalid acquisition pixel size in master Zarr.")
+            return value
+        csv_files = sorted(root_folder.glob("[pP]haseCC_stitching_*.csv"))
+        if csv_files:
+            try:
+                values = pd.to_numeric(pd.read_csv(csv_files[0])["PixelSizeMicron"], errors="coerce").dropna()
+                if not values.empty and np.isfinite(values).all() and (values > 0).all():
+                    return float(values.max())
+            except (OSError, ValueError, KeyError, pd.errors.ParserError):
+                pass
+        return None
+
     def export_to_czi(self) -> None:
         if self._is_export_running():
             show_error("An export, upload, or download task is already running.")
@@ -1924,7 +2091,13 @@ class AtlasCCIWidget(QWidget):
             return
 
         czi_path = self._aligned_czi_path()
-        pix_xy = float(self.pixel_size.get("Value", 1.0))
+        try:
+            pix_xy = self._project_xy_pixel_size_um(Path(self.main_directory))
+        except Exception as exc:
+            show_error(f"Could not read XY pixel size: {exc}")
+            return
+        if pix_xy is None:
+            pix_xy = float(self.pixel_size.get("Value", 1.0))
         pix_z = self._axial_pixel_size_nm() * 1e-3
         compression_options = self._czi_compression_options()
 
@@ -2098,15 +2271,12 @@ class AtlasCCIWidget(QWidget):
         if not self.update_pixel_size_from_input():
             return
 
-        csv_files = sorted(Path(self.main_directory).glob("[pP]haseCC_stitching_*.csv"))
-        xy_nm = None
-        if csv_files:
-            try:
-                values = pd.to_numeric(pd.read_csv(csv_files[0])["PixelSizeMicron"], errors="coerce").dropna()
-                if not values.empty and np.isfinite(values).all() and (values > 0).all():
-                    xy_nm = round(float(values.max()) * 1000, 6)
-            except (OSError, ValueError, KeyError, pd.errors.ParserError):
-                pass
+        try:
+            xy_um = self._project_xy_pixel_size_um(Path(self.main_directory))
+        except Exception as exc:
+            show_error(f"Could not read XY pixel size: {exc}")
+            return
+        xy_nm = round(xy_um * 1000, 6) if xy_um is not None else None
 
         dialog = UploadDataDialog(self)
         dialog.set_values(

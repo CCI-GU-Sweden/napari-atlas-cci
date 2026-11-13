@@ -18,7 +18,7 @@ Browse and load an atlas project. An atlas project is composed of a series of S_
 
 ### 2D stitching
 
-For 2D stitching, it is possible to process one, multiple or all S_ folder. This will stitch images in a S_ folder in one tiff image. The number of images being processes at the same time is dependent to the number of core in your PC. Be carefull on RAM consumption.
+For 2D stitching, select one, multiple, or all S_ folders. Stitched sections and their metadata are stored in `stitched_sections.zarr` in the project folder. The thread count in Options controls how many sections can be stitched concurrently; higher counts require more memory.
 
 ![On going stitching](assets/Stitching_ongoing.png)
 
@@ -26,7 +26,7 @@ After processing, you can select one S_ folder and display the image in Napari.
 
 ### Z alignement
 
-It is only possible to process to the z-alignement if all S_ folder has been stitched.
+Initial Z alignment uses completed sections in the master Zarr, in numeric section order or in the order specified by `correct_order.txt`.
 The alignement is required to run first a on downsampled image. This downsampling factor can be control in the Options.
 
 Once the initial alignement is completed, a preview image is display. Please confirm that the alignement is correct through the z volume.
@@ -86,7 +86,7 @@ portable project configurations and historical run snapshots described in
 
 ### Export and upload
 
-All intermediate files are stored in the root folder of the Atlas project. Individual planes are stored as tiff images, will the alignement is stored as a pickle pandas table. The z aligned files (both the downsample and the final ones) are saved in a ome-zarr format.
+Stitched sections are stored in `stitched_sections.zarr` in the project folder. Alignment results are saved as a pandas pickle table under `alignment_results`. The preview and full-resolution aligned data are written as Zarr arrays and OME-Zarr pyramids.
 
 For easier data manipulation, it is possible to export the final alignement as a czi file. The other option is to upload the data on [Webknossos](https://webknossos.org/), which is great for both visualization and fine z-alignement. To do this upload, it is required to have a account on webknossos and to indicate your token for the upload.
 
