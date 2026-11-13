@@ -1,15 +1,16 @@
 import napari
 import re
 import textwrap
+from queue import SimpleQueue, Empty
 from pathlib import Path
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import cast
 import tifffile as tiff
 import pandas as pd
 import numpy as np
 from napari.utils.notifications import show_error
 from napari.utils.notifications import show_info
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt, QTimer, QSettings
 from qtpy.QtGui import QBrush, QColor, QDoubleValidator
 from qtpy.QtWidgets import (
     QApplication,
@@ -73,6 +74,8 @@ class AtlasCCIWidget(QWidget):
         self._is_processing = False
         self._executor: ThreadPoolExecutor | None = None
         self._series_futures: dict[Path, Future] = {}
+        self._stitch_events = SimpleQueue()
+        self._master_sections_cache = None
         self._processing_order: list[Path] = []
         self._next_queue_index = 0
         self._status_timer = QTimer(self)
@@ -299,15 +302,21 @@ class AtlasCCIWidget(QWidget):
         self.update_series_status_indicators(project_root)
 
     def browse_for_atlas_project(self) -> None:
+        preferences = QSettings("CCI-GU-Sweden", "napari-atlas-cci")
+        remembered = preferences.value("last_project_folder", "", type=str)
+        start = Path(remembered or self.path_edit.text().strip() or str(self.main_directory)).expanduser()
+        while not start.is_dir() and start != start.parent:
+            start = start.parent
+        if not start.is_dir():
+            start = Path.home()
         selected_dir = QFileDialog.getExistingDirectory(
-            self,
-            "Select Atlas Project Folder",
-            self.path_edit.text().strip() or str(self.main_directory),
+            self, "Select Atlas Project Folder", str(start),
         )
         if not selected_dir:
             return
 
         self.main_directory = Path(selected_dir)
+        preferences.setValue("last_project_folder", str(self.main_directory))
 
         self.path_edit.setText(str(self.main_directory))
         self.refresh_local_folder_tree()
@@ -399,6 +408,26 @@ class AtlasCCIWidget(QWidget):
 
         return None
 
+    def _read_master_sections(self, root_folder: Path):
+        store_path = root_folder / "stitched_sections.zarr"
+        if not store_path.is_dir():
+            return {}
+        from atlas.io import StitchedZarrStore
+        store = StitchedZarrStore.open(store_path)
+        records = {}
+        for key in store.sections:
+            record = store.sections[key].attrs
+            source = record.get("source_folder")
+            if record.get("status") == "complete" and source:
+                records[Path(source).resolve()] = int(record["atlas_section_number"])
+        return records
+
+    def _master_store_section_number(self, root_folder: Path, series_folder: Path):
+        records = self._master_sections_cache
+        if records is None:
+            records = self._read_master_sections(root_folder)
+        return records.get(series_folder.resolve())
+
     def _evaluate_series_status(self, root_folder: Path, series_folder: Path) -> tuple[str, QColor]:
         if series_folder in self.ongoing_series:
             return "ONGOING", ONGOING
@@ -406,6 +435,9 @@ class AtlasCCIWidget(QWidget):
             return "PENDING", PENDING
         if series_folder in self.failed_series:
             return "FAILED", FAILED
+
+        if self._master_store_section_number(root_folder, series_folder) is not None:
+            return "PROCESSED", PROCESSED
 
         has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_folder)
         has_any_output = has_tiff or has_csv or has_json
@@ -430,6 +462,8 @@ class AtlasCCIWidget(QWidget):
         return "UNPROCESSED", UNPROCESSED
 
     def _is_series_processed(self, root_folder: Path, series_folder: Path) -> bool:
+        if self._master_store_section_number(root_folder, series_folder) is not None:
+            return True
         has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_folder)
         return has_tiff and has_csv and has_json
 
@@ -522,7 +556,7 @@ class AtlasCCIWidget(QWidget):
         )
 
         if not self._is_zalign_running() and not self._is_export_running():
-            self.zalign_zshift_button.setEnabled(all_processed)
+            self.zalign_zshift_button.setEnabled(all_processed and not (root_folder / "stitched_sections.zarr").exists())
             self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
             self.correction_Z_btn.setEnabled(has_zcalc)
             self.correction_apply_btn.setEnabled(has_zcalc)
@@ -543,6 +577,7 @@ class AtlasCCIWidget(QWidget):
         if root_item is None:
             return
 
+        self._master_sections_cache = self._read_master_sections(root_folder)
         for idx in range(root_item.childCount()):
             child_item = root_item.child(idx)
             series_path = self._get_series_path_from_item(child_item)
@@ -554,11 +589,13 @@ class AtlasCCIWidget(QWidget):
             child_item.setData(0, SERIES_STATUS_COLOR_ROLE, status_color)
 
             has_tiff, has_csv, has_json = self._has_expected_output_files(root_folder, series_path)
+            master_section = self._master_store_section_number(root_folder, series_path)
             child_item.setToolTip(
                 0,
                 (
                     f"{series_path}\n"
                     f"Status: {status_text}\n"
+                    f"master Zarr: {f'S_{master_section}' if master_section is not None else 'not complete'}\n"
                     f"stitched tiff: {'yes' if has_tiff else 'no'}\n"
                     f"phaseCC csv: {'yes' if has_csv else 'no'}\n"
                     f"transform json: {'yes' if has_json else 'no'}"
@@ -567,9 +604,9 @@ class AtlasCCIWidget(QWidget):
 
         self._update_selected_series_visuals()
         self.local_folder_tree.viewport().update()
-        QApplication.processEvents()
         self._update_project_leaf_and_zalign_controls(root_folder)
         self._update_display_button_state(root_folder)
+        self._master_sections_cache = None
 
     def _start_processing_queue(self, series_paths: list[Path]) -> None:
         if self._is_processing:
@@ -599,27 +636,38 @@ class AtlasCCIWidget(QWidget):
         # Queue bookkeeping for status labels.
         self._is_processing = True
         self._processing_order = to_process
-        self._next_queue_index = min(worker_count, len(to_process))
-        self.pending_series = set(to_process[self._next_queue_index:])
-        self.ongoing_series = set(to_process[:self._next_queue_index])
+        self._stitch_events = SimpleQueue()
+        self.pending_series = set(to_process)
+        self.ongoing_series = set()
         self.failed_series.difference_update(set(to_process))
 
-        self._executor = ThreadPoolExecutor(max_workers=worker_count)
-        self._series_futures = {
-            series_path: self._executor.submit(self._process_one_series, series_path)
-            for series_path in to_process
-        }
+        self._series_futures = {series_path: Future() for series_path in to_process}
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._batch_future = self._executor.submit(
+            self._run_stitching_batch, root_folder, to_process,
+            worker_count, self._series_futures.copy(),
+        )
 
         self.update_series_status_indicators(root_folder)
         self._status_timer.start()
 
     def _poll_processing_futures(self) -> None:
         if not self._series_futures:
-            self._finish_processing_queue()
+            if self._batch_future.done():
+                self._finish_processing_queue()
             return
 
         root_folder = Path(self.main_directory)
         done_series: list[Path] = []
+        started = False
+        while True:
+            try:
+                path = self._stitch_events.get_nowait()
+            except Empty:
+                break
+            self.pending_series.discard(path)
+            self.ongoing_series.add(path)
+            started = True
 
         for series_path, future in self._series_futures.items():
             if not future.done():
@@ -640,20 +688,13 @@ class AtlasCCIWidget(QWidget):
                 self.failed_series.add(series_path)
                 print(f"Series failed for {series_path.name}: {error_message}")
 
-            if self._next_queue_index < len(self._processing_order):
-                next_series = self._processing_order[self._next_queue_index]
-                self._next_queue_index += 1
-                if next_series in self.pending_series:
-                    self.pending_series.discard(next_series)
-                    self.ongoing_series.add(next_series)
-
         for series_path in done_series:
             self._series_futures.pop(series_path, None)
 
-        if done_series:
+        if done_series or started:
             self.update_series_status_indicators(root_folder)
 
-        if not self._series_futures:
+        if not self._series_futures and self._batch_future.done():
             self._finish_processing_queue()
 
     def _finish_processing_queue(self) -> None:
@@ -982,77 +1023,72 @@ class AtlasCCIWidget(QWidget):
         enabled = self._is_series_processed(root_folder, series_path)
         self.display_btn.setEnabled(enabled)
 
-    def _process_one_series(self, series_path: Path) -> tuple[bool, str]:
-        from atlas.stitching import stitch_ATLAS_tiles
-        import json
+    def _run_stitching_batch(self, root_folder, series_paths, worker_count, results):
+        """Own the shared writer until all stitching threads have stopped."""
+        from atlas.io import StitchedZarrStore, get_metadata_for_stitched_tif
 
-        buffer_in_microns = 1
-        found_mif = False
-
-        print(f"Processing series folder: {series_path}")
-        first_tif_path = next(series_path.glob("*.tif"))
-        series_id = extract_s_number(first_tif_path)
-        output_tif_path = Path(self.main_directory).joinpath(f"stitched_image_S_{series_id}.tiff")
-        output_cc_path = Path(self.main_directory).joinpath(f"phaseCC_stitching_S_{series_id}.csv")
-        output_jason_path = Path(self.main_directory).joinpath(f"transforms_S_{series_id}.json")
-
-        for file in series_path.iterdir():
-            if file.is_file() and file.suffix.lower() in {".ve-mif"}:
-                found_mif = True
-                print(f"File with '.ve-mif' extension found: {file.name}")
-                mif_file = Path(file)
-                print(f"Output TIFF path: {output_tif_path}")
-                print(f"Output CSV path: {output_cc_path}")
-                print(f"Output JSON path: {output_jason_path}")
-                print(f"🔄 Stitching image for {series_id}...")
-                
+        prepared = []
+        try:
+            for path in series_paths:
                 try:
-                    stitching_result = stitch_ATLAS_tiles(
-                        mif_file,
-                        buffer_microns=buffer_in_microns,
-                        max_shift_pixels=self.settings.max_shift_pixels,
-                    )
-                    if len(stitching_result) == 3:
-                        stitched_img, mif_tile_df, transform_dict = stitching_result
-                        stitching_metadata = None
-                    else:
-                        stitched_img, mif_tile_df, transform_dict, stitching_metadata = stitching_result
+                    mifs = [p for p in path.iterdir()
+                            if p.is_file() and p.suffix.lower() == ".ve-mif"]
+                    if len(mifs) != 1:
+                        raise ValueError(f"Expected one .ve-mif file; found {len(mifs)}")
+                    metadata = get_metadata_for_stitched_tif(mifs[0])
+                    prepared.append((path, mifs[0], metadata))
+                except Exception as exc:
+                    results[path].set_result((False, str(exc)))
+            numbers = [item[2]["atlas_section_number"] for item in prepared]
+            if len(numbers) != len(set(numbers)):
+                raise ValueError("Selected folders contain duplicate ATLAS section numbers")
+            if not prepared:
+                return
+            prepared.sort(key=lambda item: item[2]["atlas_section_number"])
+            store = StitchedZarrStore.open(root_folder / "stitched_sections.zarr")
+            with store.parallel_writer([item[2]["atlas_section_number"] for item in prepared]) as writer:
+                with ThreadPoolExecutor(max_workers=worker_count) as workers:
+                    futures = {}
+                    for path, mif, metadata in prepared:
+                        number = metadata["atlas_section_number"]
+                        if writer.is_complete(number):
+                            source = store.sections[f"S_{number}"].attrs.get("source_folder")
+                            if source and Path(source).resolve() == path.resolve():
+                                results[path].set_result((True, ""))
+                            else:
+                                results[path].set_result((False, f"S_{number} belongs to another source folder"))
+                            continue
+                        futures[workers.submit(self._process_one_series, path, mif, metadata, writer)] = (path, number)
+                    for future in as_completed(futures):
+                        path, number = futures[future]
+                        try:
+                            future.result()
+                            results[path].set_result((True, ""))
+                        except Exception as exc:
+                            writer.mark_failed(number, exc)
+                            results[path].set_result((False, str(exc)))
+        except Exception as exc:
+            for path in series_paths:
+                if not results[path].done():
+                    results[path].set_result((False, str(exc)))
+            print(f"Stitching batch failed: {exc}", flush=True)
 
-                    # Save the full image as a TIFF file
-                    tiff.imwrite(
-                        output_tif_path,
-                        np.flipud(stitched_img),
-                        metadata={
-                            "axes": "YX",
-                            "stitching_metadata": stitching_metadata,
-                        },
-                    )
-                    if stitching_metadata is not None:
-                        metadata_path = output_tif_path.with_name(
-                            output_tif_path.stem + "_metadata.json"
-                        )
-                        with open(metadata_path, "w") as f:
-                            json.dump(stitching_metadata, f, indent=4)
-                    
-                    mif_tile_df.to_csv(output_cc_path, index=False)
+    def _process_one_series(self, series_path, mif_file, metadata, writer):
+        from atlas.stitching import stitch_ATLAS_tiles
 
-                    # Convert NumPy arrays to lists for JSON compatibility
-                    json_ready_dict = {k: v.tolist() for k, v in transform_dict.items()}
-
-                    # Save to JSON file
-                    with open(output_jason_path, "w") as f:
-                        json.dump(json_ready_dict, f, indent=2)
-                    return True, ""
-                        
-                except Exception as e:
-                    # Handle any error
-                    print(f"Unexpected error with item {file}: {e}")
-                    return False, str(e)
-
-        if not found_mif:
-            return False, "No .ve-mif file found in series folder"
-
-        return True, ""
+        number = metadata["atlas_section_number"]
+        self._stitch_events.put(series_path)
+        print(f"Stitching S_{number} into the master Zarr...", flush=True)
+        image, tile_df, transforms, stitching_metadata = stitch_ATLAS_tiles(
+            mif_file, buffer_microns=1, max_shift_pixels=self.settings.max_shift_pixels,
+        )
+        writer.write_section(
+            atlas_section_number=number, image=np.flipud(image),
+            acquisition_metadata=metadata, stitching_metadata=stitching_metadata,
+            transforms={key: value.tolist() for key, value in transforms.items()},
+            source_folder=series_path, tile_dataframe=tile_df,
+        )
+        print(f"Finished stitching S_{number} into the master Zarr.", flush=True)
 
     def process_selected_series(
         self,
@@ -1111,6 +1147,15 @@ class AtlasCCIWidget(QWidget):
             return
 
         series_id = extract_s_number(series_path.name)
+        number = self._master_store_section_number(root_folder, series_path)
+        if number is not None:
+            try:
+                from atlas.io import StitchedZarrStore
+                store = StitchedZarrStore.open(root_folder / "stitched_sections.zarr")
+                self.viewer.add_image(store.read_section(number), name=f"Stitched Image S_{number}")
+            except Exception as exc:
+                show_error(f"Failed to load stitched image: {exc}")
+            return
         stitched_image_path = self._get_stitched_image_path(root_folder, series_path)
 
         if stitched_image_path is None:
