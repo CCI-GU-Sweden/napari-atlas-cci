@@ -556,11 +556,12 @@ class AtlasCCIWidget(QWidget):
         )
 
         if not self._is_zalign_running() and not self._is_export_running():
-            self.zalign_zshift_button.setEnabled(all_processed and not (root_folder / "stitched_sections.zarr").exists())
+            has_master = (root_folder / "stitched_sections.zarr").is_dir()
+            self.zalign_zshift_button.setEnabled(not self._is_processing and (all_processed or has_master))
             self.zalign_preview_button.setEnabled(has_preview_ome_zarr)
-            self.correction_Z_btn.setEnabled(has_zcalc)
-            self.correction_apply_btn.setEnabled(has_zcalc)
-            self.zalign_final_button.setEnabled(has_zcalc)
+            self.correction_Z_btn.setEnabled(has_zcalc and not has_master)
+            self.correction_apply_btn.setEnabled(has_zcalc and not has_master)
+            self.zalign_final_button.setEnabled(has_zcalc and not has_master)
             self.zalign_view_button.setEnabled(has_aligned_ome_zarr)
             self.export_czi_button.setEnabled(has_zarr)
             self.upload_wkn_button.setEnabled(has_zarr)
@@ -1187,6 +1188,25 @@ class AtlasCCIWidget(QWidget):
         axial_value: float,
         axial_unit: str,
     ) -> tuple[bool, str, dict[str, float | str] | None]:
+        store_path = root_folder / "stitched_sections.zarr"
+        if store_path.is_dir():
+            from atlas.io import StitchedZarrStore
+            from atlas.alignment import (
+                initialize_zarr_alignment_df, pairwise_zarr_alignment,
+                calculate_cumulative_shifts,
+            )
+            store = StitchedZarrStore.open(store_path)
+            checks = store.validate_section_pixel_sizes()
+            xy_um = float(checks["Acquisition Pixel size"]["first_um"])
+            order = store.ordered_sections(order_path=root_folder / "correct_order.txt")
+            frame = initialize_zarr_alignment_df(store, order, self.settings.downsampling_factor)
+            frame = pairwise_zarr_alignment(frame, store)
+            frame = calculate_cumulative_shifts(frame)
+            output = root_folder / "alignment_results"
+            output.mkdir(parents=True, exist_ok=True)
+            frame.to_pickle(output / "z_alignment_results.pkl")
+            return True, "", {"Value": xy_um, "Axial": float(axial_value), "Unit": axial_unit}
+
         csv_candidates = sorted(root_folder.glob("phaseCC_stitching_*.csv"))
         if not csv_candidates:
             csv_candidates = sorted(root_folder.glob("PhaseCC_stitching_*.csv"))
@@ -1358,13 +1378,22 @@ class AtlasCCIWidget(QWidget):
         print(z_align_df.head(5))
 
         settings = self.settings
-        zarr_array, _ = apply_alignment(
-            z_align_df,
-            buffer_pixels=20,
-            percentile_low=settings.percentile_low,
-            percentile_high=settings.percentile_high,
-            use_down_sample=True,
-        )
+        store_path = root_folder / "stitched_sections.zarr"
+        if store_path.is_dir() and "store_path" in z_align_df.columns:
+            from atlas.io import StitchedZarrStore, apply_alignment_zarr
+            store = StitchedZarrStore.open(store_path)
+            preview_path = root_folder / "aligned_preview.zarr"
+            zarr_array, _ = apply_alignment_zarr(
+                z_align_df, store, output_path=preview_path,
+                buffer_pixels=20, percentile_low=settings.percentile_low,
+                percentile_high=settings.percentile_high, use_down_sample=True,
+            )
+        else:
+            zarr_array, _ = apply_alignment(
+                z_align_df, buffer_pixels=20,
+                percentile_low=settings.percentile_low,
+                percentile_high=settings.percentile_high, use_down_sample=True,
+            )
 
         try:
             data, atlas_metadata = self._normalize_aligned_array_axes(zarr_array)
@@ -1378,7 +1407,7 @@ class AtlasCCIWidget(QWidget):
             atlas_metadata,
         )
         legacy_zarr_path = self._legacy_alignment_zarr_path(root_folder)
-        if legacy_zarr_path.exists():
+        if legacy_zarr_path != store_path and legacy_zarr_path.exists():
             shutil.rmtree(legacy_zarr_path)
 
         return success, message, payload
@@ -1604,7 +1633,10 @@ class AtlasCCIWidget(QWidget):
             return
 
         root_folder = Path(self.main_directory)
-        if not self._all_series_processed(root_folder):
+        if self._is_processing:
+            show_error("Wait for stitching to finish before starting Z alignment.")
+            return
+        if not (root_folder / "stitched_sections.zarr").is_dir() and not self._all_series_processed(root_folder):
             show_error("Initial Z alignment requires all series to be processed first.")
             self.update_series_status_indicators(root_folder)
             return
