@@ -1,5 +1,12 @@
 # napari atlas cci
 
+> **Development has moved:** The Napari plugin is now maintained in the
+> [ATLAS repository](https://github.com/CCI-GU-Sweden/ATLAS/tree/main/plugin).
+> For current installation instructions and usage, see the
+> [ATLAS documentation](https://cci-gu-sweden.github.io/ATLAS/plugin/install/)
+> and the [napari-atlas-cci package on PyPI](https://pypi.org/project/napari-atlas-cci/).
+> This repository is retained as a read-only historical reference.
+
 A napari plugin for stitching and aligning array tomography data acquired with
 FIBICS ATLAS. It provides a graphical interface to the
 [CCI ATLAS backend](https://github.com/CCI-GU-Sweden/ATLAS).
